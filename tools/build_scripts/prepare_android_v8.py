@@ -501,7 +501,7 @@ def build(cache, config, ndk):
     prepare_icu(source)
     gn_ninja = ensure_gn_ninja(cache, source)
     clang = find_host_clang()
-    libclang = find_libclang(cache / "build" / config["target"] / "release/clang/lib")
+    libclang = find_libclang(source / "third_party/rust-toolchain/lib")
     lld = find_lld(clang)
     try:
         run(["rustup", "target", "add", config["target"]], check=False)
