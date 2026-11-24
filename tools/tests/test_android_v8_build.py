@@ -2,6 +2,7 @@
 from pathlib import Path
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -86,6 +87,13 @@ class AndroidV8BuildTests(unittest.TestCase):
         with patch.dict(os.environ, {"OPERIT_ANDROID_V8_API_LEVEL": "22"}):
             with self.assertRaisesRegex(RuntimeError, "OPERIT_ANDROID_V8_API_LEVEL"):
                 v8.api_level()
+
+    def test_command_output_is_decoded_as_utf8(self):
+        completed = subprocess.CompletedProcess(["cargo", "metadata"], 0, stdout="café\n", stderr="")
+        with patch.object(v8.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(v8.output(["cargo", "metadata"]), "café")
+        self.assertEqual(run.call_args.kwargs["encoding"], "utf-8")
+        self.assertEqual(run.call_args.kwargs["errors"], "replace")
 
     def test_build_failure_emits_no_environment_and_never_falls_back_to_download(self):
         env_file = self.root / "v8.env"
