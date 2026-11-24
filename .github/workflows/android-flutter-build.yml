@@ -94,11 +94,12 @@ jobs:
         with:
           node-version: 24
 
-      - name: Install repository JavaScript build tools
+      - name: Install repository build tools
         shell: pwsh
         run: |
           npm install --prefix .ci-tools/typescript --no-audit --no-fund typescript@5.9.3
           corepack enable pnpm
+          python -m venv .venv
 
       - name: Install Java
         uses: actions/setup-java@v4
