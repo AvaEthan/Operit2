@@ -95,6 +95,18 @@ class AndroidV8BuildTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["encoding"], "utf-8")
         self.assertEqual(run.call_args.kwargs["errors"], "replace")
 
+    def test_linux_can_use_the_clang_downloaded_by_v8(self):
+        downloaded = self.root / "clang/lib"
+        with patch.object(v8, "IS_WINDOWS", False), \
+             patch.object(v8.sys, "platform", "linux"), \
+             patch.object(v8.Path, "glob", return_value=[]):
+            self.assertEqual(v8.find_libclang(downloaded), downloaded)
+
+    def test_windows_rejects_unsupported_v8_source_builds_early(self):
+        with patch.object(v8, "IS_WINDOWS", True):
+            with self.assertRaisesRegex(RuntimeError, "require Linux"):
+                v8.build(self.cache, self.config, None)
+
     def test_build_failure_emits_no_environment_and_never_falls_back_to_download(self):
         env_file = self.root / "v8.env"
         with patch.object(v8, "version_from_lock", return_value="152.2.0"), \
@@ -113,6 +125,15 @@ class AndroidV8BuildTests(unittest.TestCase):
             'environment("OPERIT_ANDROID_V8_NDK", android.ndkDirectory.absolutePath)', preparation)
         self.assertIn(
             'inputs.property("androidNdkDirectory", android.ndkDirectory.absolutePath)', preparation)
+
+    def test_workflow_builds_v8_on_linux_and_downloads_it_on_windows(self):
+        workflow = (v8.REPO_ROOT / ".github/workflows/android-flutter-build.yml").read_text()
+        runtime, windows = workflow.split("  build-android:\n", 1)
+        self.assertIn("runs-on: ubuntu-24.04", runtime)
+        self.assertIn("python3 tools/build_scripts/prepare_android_v8.py", runtime)
+        self.assertIn("name: operit2-android-v8-", runtime)
+        self.assertIn("name: Download Android V8", windows)
+        self.assertIn("needs.build-android-runtime.outputs.v8-version", windows)
 
     def test_explicit_gradle_ndk_is_used_without_sdk_environment(self):
         """Resolve the supplied Windows NDK without ambient SDK discovery or downloads."""

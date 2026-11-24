@@ -9,7 +9,12 @@ permissions:
 jobs:
   build-android-runtime:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 180
+    outputs:
+      v8-version: ${{ steps.v8.outputs.version }}
+    env:
+      RUSTFLAGS: -Awarnings
+      RUST_TOOLCHAIN_VERSION: 1.95.0
 
     defaults:
       run:
@@ -42,14 +47,55 @@ jobs:
         shell: pwsh
         run: pwsh -NoProfile -File tools/android-runtime/fetch_sources.ps1
 
-      - name: Fetch Android NDK
-        run: bash tools/android-runtime/fetch_ndk_wsl.sh
+      - name: Fetch Android NDKs
+        run: |
+          bash tools/android-runtime/fetch_ndk_wsl.sh
+          cache_dir="$HOME/.cache/operit-android-runtime"
+          v8_ndk_dir="$cache_dir/android-ndk-28.2.13676358"
+          if [ ! -f "$v8_ndk_dir/source.properties" ]; then
+            curl -fL --retry 3 -o "$cache_dir/android-ndk-r28b-linux.zip" \
+              https://dl.google.com/android/repository/android-ndk-r28b-linux.zip
+            rm -rf "$v8_ndk_dir"
+            unzip -q "$cache_dir/android-ndk-r28b-linux.zip" -d "$cache_dir"
+            rm -f "$cache_dir/android-ndk-r28b-linux.zip"
+          fi
+          cat "$v8_ndk_dir/source.properties"
 
       - name: Build Android terminal runtime
         run: |
           export ANDROID_NDK_HOME="$HOME/.cache/operit-android-runtime/android-ndk-r29-beta4"
           bash tools/android-runtime/build_android_tools_wsl.sh
           bash tools/android-runtime/build_alpine_rootfs_wsl.sh
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          targets: aarch64-linux-android
+
+      - name: Cache source-built Android V8
+        uses: actions/cache@v4
+        with:
+          path: tools/release/work/android-v8/*/aarch64-linux-android
+          key: ${{ runner.os }}-${{ runner.arch }}-android-v8-${{ hashFiles('tools/build_scripts/prepare_android_v8.py', 'apps/flutter/native/operit-flutter-bridge/Cargo.lock') }}-ndk-28.2.13676358
+
+      - name: Build Android V8
+        id: v8
+        run: |
+          version="$(python3 -c 'import pathlib, tomllib; lock = tomllib.loads(pathlib.Path("apps/flutter/native/operit-flutter-bridge/Cargo.lock").read_text("utf-8")); print(next(p["version"] for p in lock["package"] if p["name"] == "v8"))')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          OPERIT_ANDROID_V8_NDK="$HOME/.cache/operit-android-runtime/android-ndk-28.2.13676358" \
+            python3 tools/build_scripts/prepare_android_v8.py \
+              --target aarch64-linux-android \
+              --env-file tools/release/work/android-v8/aarch64-linux-android.env
+
+      - name: Upload Android V8
+        uses: actions/upload-artifact@v4
+        with:
+          name: operit2-android-v8-${{ github.sha }}
+          path: tools/release/work/android-v8/${{ steps.v8.outputs.version }}/aarch64-linux-android
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Upload Android terminal runtime
         uses: actions/upload-artifact@v4
@@ -83,6 +129,12 @@ jobs:
         with:
           name: operit2-android-runtime-${{ github.sha }}
           path: apps/flutter/app/android/app/src/main
+
+      - name: Download Android V8
+        uses: actions/download-artifact@v4
+        with:
+          name: operit2-android-v8-${{ github.sha }}
+          path: tools/release/work/android-v8/${{ needs.build-android-runtime.outputs.v8-version }}/aarch64-linux-android
 
       - name: Install bootstrap Dart
         uses: dart-lang/setup-dart@v1
@@ -178,12 +230,6 @@ jobs:
           RELEASE_KEY_ALIAS=$env:ANDROID_RELEASE_KEY_ALIAS
           RELEASE_KEY_PASSWORD=$env:ANDROID_RELEASE_KEY_PASSWORD
           "@ | Set-Content -Path (Join-Path $secretsDir "android-signing.properties") -Encoding utf8
-
-      - name: Cache source-built Android V8
-        uses: actions/cache@v4
-        with:
-          path: tools/release/work/android-v8
-          key: ${{ runner.os }}-${{ runner.arch }}-android-v8-${{ hashFiles('tools/build_scripts/prepare_android_v8.py', 'apps/flutter/native/operit-flutter-bridge/Cargo.lock') }}
 
       - name: Check build environment
         shell: pwsh

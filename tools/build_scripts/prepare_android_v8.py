@@ -369,7 +369,7 @@ def find_host_clang():
     return None
 
 
-def find_libclang():
+def find_libclang(downloaded_clang_lib: Path | None = None):
     """Locate libclang 21.1+ for the source bindings generation."""
     if IS_WINDOWS:
         directory = (Path(os.environ["OPERIT_LIBCLANG_DIR"])
@@ -394,6 +394,8 @@ def find_libclang():
             return library.parent
     if sys.platform == "darwin" and libraries:
         return libraries[0].parent
+    if downloaded_clang_lib is not None:
+        return downloaded_clang_lib
     raise RuntimeError(
         "V8 source bindings require LLVM/libclang 21.1 or newer "
         "(apt install llvm-21-dev / brew install llvm@23)")
@@ -480,6 +482,8 @@ def ensure_gn_ninja(cache, source):
 
 
 def build(cache, config, ndk):
+    if IS_WINDOWS:
+        raise RuntimeError("Android V8 source builds require Linux; restore a matching prebuilt cache")
     probe = cache / "probe"
     (probe / "src").mkdir(parents=True, exist_ok=True)
     (probe / "Cargo.toml").write_text(
@@ -497,7 +501,7 @@ def build(cache, config, ndk):
     prepare_icu(source)
     gn_ninja = ensure_gn_ninja(cache, source)
     clang = find_host_clang()
-    libclang = find_libclang()
+    libclang = find_libclang(cache / "build" / config["target"] / "release/clang/lib")
     lld = find_lld(clang)
     try:
         run(["rustup", "target", "add", config["target"]], check=False)
