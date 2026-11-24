@@ -28,6 +28,9 @@ fn dart_field_default_expr(field: &SerializableField, dart_ty: &str) -> Option<&
     if !field.has_serde_default {
         return None;
     }
+    if field.name == "toolResultInlineLimit" {
+        return Some("4000");
+    }
     match dart_ty {
         "String" | "int" | "double" | "bool" | "Uint8List" => Some(dart_default_value(dart_ty)),
         ty if ty.starts_with("List<") || ty.starts_with("Map<") || ty.ends_with('?') => {
@@ -644,14 +647,45 @@ fn render_dart_struct(
     if fields.is_empty() {
         output.push_str(&format!("  const {class_name}();\n\n"));
     } else {
-        output.push_str(&format!("  const {class_name}({{\n"));
+        let runtime_defaults = fields
+            .iter()
+            .filter_map(|field| {
+                let field_type = dart_type(&field.ty, serializable_types);
+                (dart_field_default_expr(field, &field_type) == Some("Uint8List(0)"))
+                    .then(|| (dart_identifier(&field.name), field_type))
+            })
+            .collect::<Vec<_>>();
+        let constructor_modifier = if runtime_defaults.is_empty() { "const " } else { "" };
+        output.push_str(&format!("  {constructor_modifier}{class_name}({{\n"));
         for field in fields {
-            output.push_str(&format!(
-                "    required this.{},\n",
-                dart_identifier(&field.name)
-            ));
+            let field_type = dart_type(&field.ty, serializable_types);
+            match dart_field_default_expr(field, &field_type) {
+                Some("Uint8List(0)") => output.push_str(&format!(
+                    "    {}? {},\n",
+                    field_type,
+                    dart_identifier(&field.name)
+                )),
+                Some(default) => output.push_str(&format!(
+                    "    this.{} = {},\n",
+                    dart_identifier(&field.name),
+                    default
+                )),
+                None => output.push_str(&format!(
+                    "    required this.{},\n",
+                    dart_identifier(&field.name)
+                )),
+            }
         }
-        output.push_str("  });\n\n");
+        if runtime_defaults.is_empty() {
+            output.push_str("  });\n\n");
+        } else {
+            let initializers = runtime_defaults
+                .iter()
+                .map(|(name, field_type)| format!("{name} = {name} ?? {field_type}(0)"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            output.push_str(&format!("  }}) : {initializers};\n\n"));
+        }
     }
     output.push_str(&format!(
         "  factory {class_name}.fromJson(Map<String, Object?> json) {{\n"
@@ -2132,6 +2166,63 @@ mod tests {
                 stream,
             }),
         }
+    }
+
+    #[test]
+    fn serde_defaulted_struct_fields_are_optional_in_dart_constructors() {
+        let fields = vec![
+            SerializableField {
+                name: "maxContextLength".into(),
+                json_name: "maxContextLength".into(),
+                ty: "f32".into(),
+                has_serde_default: false,
+            },
+            SerializableField {
+                name: "toolResultInlineLimit".into(),
+                json_name: "toolResultInlineLimit".into(),
+                ty: "i64".into(),
+                has_serde_default: true,
+            },
+            SerializableField {
+                name: "foldMiddleTurns".into(),
+                json_name: "foldMiddleTurns".into(),
+                ty: "bool".into(),
+                has_serde_default: true,
+            },
+        ];
+        let ty = SerializableType {
+            full_type: "ModelContextSpec".into(),
+            supports_serialize: true,
+            supports_deserialize: true,
+            kind: SerializableTypeKind::Struct { fields: fields.clone() },
+        };
+        let code = render_dart_struct(&ty, &fields, &HashMap::new());
+        assert!(code.contains("required this.maxContextLength,"));
+        assert!(code.contains("this.toolResultInlineLimit = 4000,"));
+        assert!(code.contains("this.foldMiddleTurns = false,"));
+        assert!(!code.contains("required this.toolResultInlineLimit,"));
+        assert!(!code.contains("required this.foldMiddleTurns,"));
+    }
+
+    #[test]
+    fn runtime_byte_defaults_use_constructor_initializers() {
+        let fields = vec![SerializableField {
+            name: "frameData".into(),
+            json_name: "frameData".into(),
+            ty: "Vec<u8>".into(),
+            has_serde_default: true,
+        }];
+        let ty = SerializableType {
+            full_type: "RuntimeFrame".into(),
+            supports_serialize: true,
+            supports_deserialize: true,
+            kind: SerializableTypeKind::Struct { fields: fields.clone() },
+        };
+        let code = render_dart_struct(&ty, &fields, &HashMap::new());
+        assert!(code.contains("  RuntimeFrame({\n"));
+        assert!(code.contains("    Uint8List? frameData,\n"));
+        assert!(code.contains("  }) : frameData = frameData ?? Uint8List(0);"));
+        assert!(!code.contains("this.frameData = Uint8List(0)"));
     }
 
     #[test]

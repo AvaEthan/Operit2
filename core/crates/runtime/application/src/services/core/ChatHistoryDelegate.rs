@@ -2482,16 +2482,6 @@ impl ChatHistoryDelegate {
     }
 
     #[allow(non_snake_case)]
-    /// Finds the insertion position after the latest AI message.
-    pub fn findProperSummaryPosition(&self, messages: Vec<ChatMessage>) -> usize {
-        messages
-            .iter()
-            .rposition(|message| message.sender == "ai")
-            .map(|index| index + 1)
-            .unwrap_or(0)
-    }
-
-    #[allow(non_snake_case)]
     /// Toggles the chat history selector visibility.
     pub fn toggleChatHistorySelector(&mut self) {
         self.showChatHistorySelector = !self.showChatHistorySelector;

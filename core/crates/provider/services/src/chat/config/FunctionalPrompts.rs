@@ -92,6 +92,24 @@ pub const SUMMARY_PROMPT_EN: &str = r#"You are an AI assistant responsible for g
 5. Goal: the summary must be self-contained so that even if the AI forgets the original conversation, it can fully reconstruct context, current status, progress, and next actions.
 6. Recency: focus first on the most recent part of the conversation (about the last 30% of input), then review earlier content. If new messages conflict with old content, use the latest messages and explain the differences."#;
 
+pub const SUMMARY_PROTOCOL_CN: &str = r#"
+**工作协议：**
+- 保留已做出的决策、采用或放弃的方案及其原因。
+- 保留关键文件路径、命令、配置和已验证结论。
+- 明确列出未决问题、阻塞项和下一步动作。
+- 工具结果只保留结论、必要证据和 blob hash；不得复述完整工具输出。
+- 不得把对话回顾当作任务事实来源；它是导航索引，不替代上述摘要正文。
+"#;
+
+pub const SUMMARY_PROTOCOL_EN: &str = r#"
+**Working protocol:**
+- Preserve decisions, adopted or rejected approaches, and their reasons.
+- Preserve key file paths, commands, configuration, and verified conclusions.
+- State unresolved questions, blockers, and next actions explicitly.
+- For tool results, keep only conclusions, necessary evidence, and blob hashes; never repeat full tool output.
+- The conversation review is a navigation index, not a source of task facts; it does not replace the summary body above.
+"#;
+
 /// Wrapper text prepended to a persisted compact-boundary message when it is
 /// replayed into the active context as the opening user turn.
 pub const BOUNDARY_WRAPPER_CN: &str = "本会话延续自一段超出上下文限制的先前对话。以下检查点覆盖了先前对话中已被压缩的部分。";
@@ -173,6 +191,12 @@ impl FunctionalPrompts {
                 prompt.push_str("\n请将以上摘要中的关键信息，与本次新的对话内容相融合，生成一份全新的、更完整的摘要。");
             }
         }
+        prompt.push_str("\n\n");
+        prompt.push_str(if use_english {
+            SUMMARY_PROTOCOL_EN
+        } else {
+            SUMMARY_PROTOCOL_CN
+        });
         prompt
     }
 
@@ -417,5 +441,21 @@ Output must be a JSON object with keys "queries" (array of regex strings) and "r
         } else {
             format!("你是一个代码检索助手。你需要从候选片段中选择最相关的部分。\n\n用户意图：{intent}\n搜索路径：{display_path}\n\n候选列表（每条以 #id 开头）：\n{candidates_digest}\n\n要求：\n1) 输出严格 JSON，不要输出任何其他文字。\n2) 从候选中选择最多 {max_results} 条，按相关度从高到低输出 id。\n\n输出格式：{{\"selected\":[0,1,2]}}")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FunctionalPrompts;
+
+    #[test]
+    fn summary_prompt_appends_the_working_protocol_in_both_languages() {
+        let chinese = FunctionalPrompts::buildSummarySystemPrompt(Some("旧摘要"), false);
+        assert!(chinese.contains("旧摘要"));
+        assert!(chinese.contains("工作协议"));
+        assert!(chinese.contains("blob hash"));
+        let english = FunctionalPrompts::buildSummarySystemPrompt(None, true);
+        assert!(english.contains("Working protocol"));
+        assert!(english.contains("unresolved questions"));
     }
 }

@@ -102,9 +102,6 @@ impl AppDatabase {
     /// Opens the canonical schema and applies each required physical migration before publishing the database.
     fn openWithMigrations(&self) -> Result<(), AppDatabaseError> {
         let currentVersion = self.store.getUserVersion()?;
-        if currentVersion == DATABASE_VERSION {
-            return Ok(());
-        }
         if currentVersion > DATABASE_VERSION {
             return Err(AppDatabaseError::DatabaseVersionTooNew {
                 actual: currentVersion,
@@ -114,6 +111,11 @@ impl AppDatabase {
         if currentVersion == 0 {
             self.createAllTables()?;
             self.store.setUserVersion(DATABASE_VERSION)?;
+            return Ok(());
+        }
+        self.ensureToolResultBlobTable()?;
+        if currentVersion == DATABASE_VERSION {
+            self.messagePartDao().collectUnreferencedToolResultBlobs()?;
             return Ok(());
         }
 
@@ -162,10 +164,37 @@ impl AppDatabase {
         createAllTables(&self.store)
     }
 
+    fn ensureToolResultBlobTable(&self) -> Result<(), SqliteStoreError> {
+        self.store.executeBatch(
+            r#"
+            CREATE TABLE IF NOT EXISTS tool_result_blobs (
+                hash TEXT PRIMARY KEY NOT NULL,
+                chatId TEXT NOT NULL,
+                bytes INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                content TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS index_tool_result_blobs_chatId
+                ON tool_result_blobs(chatId);
+            CREATE TABLE IF NOT EXISTS pending_tool_result_blobs (
+                hash TEXT NOT NULL,
+                chatId TEXT NOT NULL,
+                participantId TEXT,
+                participantKey TEXT NOT NULL,
+                extensionOwner TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY(hash, chatId, participantKey, extensionOwner)
+            );
+            "#,
+        )
+    }
+
     /// Drops all known application tables.
     pub fn dropAllTables(&self) -> Result<(), SqliteStoreError> {
         self.store.executeBatch(
             r#"
+            DROP TABLE IF EXISTS pending_tool_result_blobs;
+            DROP TABLE IF EXISTS tool_result_blobs;
             DROP TABLE IF EXISTS message_variants;
             DROP TABLE IF EXISTS message_parts;
             DROP TABLE IF EXISTS messages;
@@ -1062,6 +1091,24 @@ pub fn createAllTables(store: &SqliteStore) -> Result<(), SqliteStoreError> {
             ON message_variants(chatId, messageTimestamp);
         CREATE UNIQUE INDEX IF NOT EXISTS index_message_variants_chatId_messageTimestamp_variantIndex
             ON message_variants(chatId, messageTimestamp, variantIndex);
+
+        CREATE TABLE tool_result_blobs (
+            hash TEXT PRIMARY KEY NOT NULL,
+            chatId TEXT NOT NULL,
+            bytes INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            content TEXT NOT NULL
+        );
+        CREATE INDEX index_tool_result_blobs_chatId ON tool_result_blobs(chatId);
+        CREATE TABLE pending_tool_result_blobs (
+            hash TEXT NOT NULL,
+            chatId TEXT NOT NULL,
+            participantId TEXT,
+            participantKey TEXT NOT NULL,
+            extensionOwner TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY(hash, chatId, participantKey, extensionOwner)
+        );
 
         CREATE TABLE message_parts (
             chatId TEXT NOT NULL,

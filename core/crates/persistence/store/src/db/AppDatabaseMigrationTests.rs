@@ -434,3 +434,36 @@ fn version29_group_migration_rolls_back_when_second_table_is_missing() {
     assert_eq!(database.store.getUserVersion().unwrap(), 29);
     assert_eq!(tableRows(&database.store), before);
 }
+
+#[test]
+fn current_databases_gain_only_the_device_local_blob_tables() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let (_, database, _) = openTestStore("tool-result-blob-schema");
+    database.dropAllTables().unwrap();
+    database.createAllTables().unwrap();
+    database
+        .store
+        .executeBatch("DROP TABLE tool_result_blobs; DROP TABLE pending_tool_result_blobs;")
+        .unwrap();
+    database.store.setUserVersion(DATABASE_VERSION).unwrap();
+    database.openWithMigrations().unwrap();
+    assert_eq!(database.store.getUserVersion().unwrap(), DATABASE_VERSION);
+    for table in ["tool_result_blobs", "pending_tool_result_blobs"] {
+        assert!(database
+            .store
+            .queryOne(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                sqliteParams![table],
+            )
+            .unwrap()
+            .is_some());
+        assert!(database
+            .store
+            .queryOne(
+                "SELECT 1 FROM sqlite_master WHERE type='trigger' AND tbl_name=?1",
+                sqliteParams![table],
+            )
+            .unwrap()
+            .is_none());
+    }
+}

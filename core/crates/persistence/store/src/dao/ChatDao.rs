@@ -98,6 +98,23 @@ impl ChatDao {
         )
     }
 
+    /// Writes a stable estimate only while the persisted accounting generation is unchanged.
+    pub fn updateChatContextWindowIfCurrent(
+        &self,
+        chatId: &str,
+        currentWindowSize: i64,
+        expectedInputTokens: i64,
+        expectedOutputTokens: i64,
+        expectedWindowSize: i64,
+        expectedUpdatedAt: i64,
+        timestamp: i64,
+    ) -> Result<bool, SqliteStoreError> {
+        Ok(self.execute_count(
+            "UPDATE chats SET currentWindowSize = ?2, updatedAt = ?3 WHERE id = ?1 AND inputTokens = ?4 AND outputTokens = ?5 AND currentWindowSize = ?6 AND updatedAt = ?7",
+            sqliteParams![chatId, currentWindowSize, timestamp, expectedInputTokens, expectedOutputTokens, expectedWindowSize, expectedUpdatedAt],
+        )? > 0)
+    }
+
     pub fn updateChatTitle(
         &self,
         chatId: &str,

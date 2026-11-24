@@ -379,6 +379,28 @@ pub trait CoreNodeToolRuntime: Send + Sync {
 
 /// Provides runtime-owned services that the tools crate must not own.
 pub trait ToolRuntimeSupport: Send + Sync {
+    fn stageToolResultBlob(
+        &self,
+        _chatId: String,
+        _participantId: Option<String>,
+        _extensionOwner: String,
+        _content: String,
+    ) -> Result<String, String> {
+        Err("Tool result blob storage is unavailable in this runtime".into())
+    }
+
+    fn readToolResultBlob(
+        &self,
+        _chatId: String,
+        _participantId: Option<String>,
+        _extensionOwner: String,
+        _hash: String,
+        _offset: usize,
+        _limit: usize,
+    ) -> Result<String, String> {
+        Err("Tool result blob storage is unavailable in this runtime".into())
+    }
+
     /// Runs the v1 migrator import with the current runtime's file and chat services.
     fn importV1MigratorArchive(&self, _path: String) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send + '_>> {
         Box::pin(async { Err("The v1 chat archive importer is unavailable in this runtime".into()) })

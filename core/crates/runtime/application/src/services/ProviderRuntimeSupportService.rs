@@ -144,15 +144,27 @@ impl ChatConfigurationApi {
     /// Resolves a send with the plugin, or uses the exact native path without plugin-owned selection data.
     pub async fn resolve(&mut self, request: ChatConfigurationRequest) -> Result<ChatConfigurationResult, String> {
         request.requirePurpose(ChatConfigurationPurpose::Execution)?;
-        if request.participantId.as_deref() != Some("model:chat") {
+        let mut configuration = if request.participantId.as_deref() != Some("model:chat") {
             if let Some(configuration) = self
                 .pluginConfiguration("chat.configuration.resolve", &request, decodeConfigurationResult)
                 .await
             {
-                return Ok(configuration);
+                configuration
+            } else {
+                nativeModelExecution(self.modelProfile(&request)?)?
             }
+        } else {
+            nativeModelExecution(self.modelProfile(&request)?)?
+        };
+        let binding = &configuration.profile.modelBinding;
+        if let Ok(model) =
+            crate::data::preferences::ModelConfigManager::ModelConfigManager::default()
+                .getResolvedModelConfig(&binding.providerId, &binding.modelId)
+        {
+            configuration.toolResultInlineLimit = model.context.toolResultInlineLimit;
+            configuration.foldMiddleTurns = model.context.foldMiddleTurns;
         }
-        nativeModelExecution(self.modelProfile(&request)?)
+        Ok(configuration)
     }
 
     /// A failed participant invalidates the whole plugin estimate; never mix native and plugin contexts.
@@ -308,6 +320,9 @@ fn nativeModelExecution(profile: ChatParticipantProfile) -> Result<ChatConfigura
         contextKey: "model:chat".into(),
         profile: profile.clone(),
         participants: vec![profile],
+        toolResultInlineLimit:
+            operit_model::ModelConfigData::ModelConfigDefaults::DEFAULT_TOOL_RESULT_INLINE_LIMIT,
+        foldMiddleTurns: false,
         executionData,
         extensionOwner: MODEL_CONFIGURATION_OWNER.into(),
     };
@@ -422,8 +437,20 @@ pub(crate) fn validateNativeModelExecutionData(snapshot: &operit_providers::runt
     if participantId != Some(saved.profile.id.as_str()) {
         return Err("Native model tool participant differs from its saved profile".into());
     }
-    let result = ChatConfigurationResult { historyPolicy: operit_providers::runtime_support::ChatHistoryPolicy { isolateParticipants: false, labelUserMessages: false }, contextKey: saved.contextKey, profile: saved.profile, participants: saved.participants,
-        executionData: snapshot.clone(), extensionOwner: MODEL_CONFIGURATION_OWNER.into() };
+    let result = ChatConfigurationResult {
+        historyPolicy: operit_providers::runtime_support::ChatHistoryPolicy {
+            isolateParticipants: false,
+            labelUserMessages: false,
+        },
+        contextKey: saved.contextKey,
+        profile: saved.profile,
+        participants: saved.participants,
+        toolResultInlineLimit:
+            operit_model::ModelConfigData::ModelConfigDefaults::DEFAULT_TOOL_RESULT_INLINE_LIMIT,
+        foldMiddleTurns: false,
+        executionData: snapshot.clone(),
+        extensionOwner: MODEL_CONFIGURATION_OWNER.into(),
+    };
     result.validate()
 }
 

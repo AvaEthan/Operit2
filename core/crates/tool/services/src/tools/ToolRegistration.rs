@@ -153,6 +153,70 @@ async fn executeSleep(tool: &AITool, context: &HostManager) -> ToolResult {
     }
 }
 
+#[allow(non_snake_case)]
+fn registerReadToolResultTool(handler: &mut AIToolHandler) {
+    const READ_TOOL_RESULT: &str = "read_tool_result";
+    let runtimeSupport = handler.runtimeSupport();
+    handler.registerToolWithVisibility(
+        READ_TOOL_RESULT.to_string(),
+        Box::new(FnToolExecutor {
+            effect: ToolEffect::READ,
+            validate: Arc::new(|tool| {
+                let hash = requiredParameterValue(tool, "hash");
+                if !operit_model::MessagePartCodec::is_tool_result_blob_hash(hash.trim()) {
+                    return ToolValidationResult {
+                        valid: false,
+                        errorMessage: "hash must be a 64-character SHA-256 value".into(),
+                    };
+                }
+                for (name, default, minimum) in [("offset", 0, 0), ("limit", 4000, 1)] {
+                    if let Some(parameter) = tool.parameters.iter().find(|parameter| parameter.name == name) {
+                        match parameter.value.parse::<usize>() {
+                            Ok(value) if value >= minimum && value <= 1_000_000 => {}
+                            _ => return ToolValidationResult {
+                                valid: false,
+                                errorMessage: format!("{name} must be an integer between {minimum} and 1000000 (default {default})"),
+                            },
+                        }
+                    }
+                }
+                ToolValidationResult { valid: true, errorMessage: String::new() }
+            }),
+            invoke: Arc::new(move |tool| {
+                let result = (|| -> Result<String, String> {
+                    let context = ToolExecutionManager::currentToolRuntimeContext()
+                        .ok_or_else(|| "read_tool_result requires an active chat".to_string())?;
+                    let chatId = context.callerChatId
+                        .ok_or_else(|| "read_tool_result requires an active chat".to_string())?;
+                    let hash = requiredParameterValue(&tool, "hash").trim().to_ascii_lowercase();
+                    let offset = tool.parameters.iter().find(|parameter| parameter.name == "offset")
+                        .map_or(0, |parameter| parameter.value.parse::<usize>().unwrap_or(0));
+                    let limit = tool.parameters.iter().find(|parameter| parameter.name == "limit")
+                        .map_or(4000, |parameter| parameter.value.parse::<usize>().unwrap_or(4000));
+                    runtimeSupport.readToolResultBlob(
+                        chatId,
+                        context.callerParticipantId,
+                        context.extensionOwner,
+                        hash,
+                        offset,
+                        limit,
+                    )
+                })();
+                match result {
+                    Ok(content) => ToolResult {
+                        toolName: tool.name.clone(),
+                        success: true,
+                        result: stringResultData(content),
+                        error: None,
+                    },
+                    Err(error) => toolErrorResult(&tool, error),
+                }
+            }),
+        }),
+        ToolRegistrationVisibility::PUBLIC,
+    );
+}
+
 /// Registers the public tools with their explicit execution contracts.
 #[allow(non_snake_case)]
 fn registerPublicTools(handler: &mut AIToolHandler, context: &HostManager) {
@@ -292,6 +356,7 @@ fn registerPublicTools(handler: &mut AIToolHandler, context: &HostManager) {
     );
 
     registerPackageActivationTool(handler);
+    registerReadToolResultTool(handler);
     let packageManager = handler.getOrCreatePackageManager();
     let searchContext = context.clone();
     let searchPackageManager = packageManager.clone();

@@ -1,4 +1,4 @@
-use crate::commands::util::{parse_bool_arg, parse_f32_arg};
+use crate::commands::util::{parse_bool_arg, parse_f32_arg, parse_i64_arg};
 use crate::output::CoreCommandOutput;
 use operit_host_api::HostManager::HostManager;
 use operit_model::ApiKeyInfo::ApiKeyInfo;
@@ -458,21 +458,38 @@ pub fn run_model_command(
             }));
         }
         "context-set" => {
-            let providerId = requiredArg(
-                args,
-                1,
-                "usage: operit2 model context-set <provider-id> <model-id> <max-context-length>",
-            )?;
-            let modelId = requiredArg(
-                args,
-                2,
-                "usage: operit2 model context-set <provider-id> <model-id> <max-context-length>",
-            )?;
-            let maxContextLength = parse_f32_arg(
-                args.get(3),
-                "usage: operit2 model context-set <provider-id> <model-id> <max-context-length>",
-            )?;
-            let context = ModelContextSpec { maxContextLength };
+            let usage = "usage: operit2 model context-set <provider-id> <model-id> <max-context-length> [tool-result-inline-limit] [fold-middle-turns]";
+            if !(4..=6).contains(&args.len()) {
+                return Err(usage.to_string());
+            }
+            let providerId = requiredArg(args, 1, usage)?;
+            let modelId = requiredArg(args, 2, usage)?;
+            let maxContextLength = parse_f32_arg(args.get(3), usage)?;
+            let resolved = command
+                .modelManager()
+                .getResolvedModelConfig(providerId, modelId)
+                .map_err(|error| error.to_string())?;
+            let toolResultInlineLimit = match args.get(4) {
+                Some(value) => {
+                    let limit = parse_i64_arg(Some(value), usage)?;
+                    if limit < 0 {
+                        return Err(
+                            "tool-result-inline-limit must be zero or a positive integer".into(),
+                        );
+                    }
+                    limit
+                }
+                None => resolved.context.toolResultInlineLimit,
+            };
+            let foldMiddleTurns = match args.get(5) {
+                Some(value) => parse_bool_arg(Some(value), usage)?,
+                None => resolved.context.foldMiddleTurns,
+            };
+            let context = ModelContextSpec {
+                maxContextLength,
+                toolResultInlineLimit,
+                foldMiddleTurns,
+            };
             let model = command
                 .modelManager()
                 .updateContextForModel(providerId, modelId, context.clone())
@@ -508,16 +525,32 @@ pub fn run_model_command(
             }));
         }
         "summary-set" => {
-            if args.len() != 5 {
-                return Err("usage: operit2 model summary-set <provider-id> <model-id> <enable-summary> <summary-token-threshold>".to_string());
+            let usage = "usage: operit2 model summary-set <provider-id> <model-id> <enable-summary> <summary-token-threshold> [soft-threshold-tokens] [debounce-tokens]";
+            if !(5..=7).contains(&args.len()) {
+                return Err(usage.to_string());
             }
-            let providerId = requiredArg(args, 1, "usage: operit2 model summary-set <provider-id> <model-id> <enable-summary> <summary-token-threshold>")?;
-            let modelId = requiredArg(args, 2, "usage: operit2 model summary-set <provider-id> <model-id> <enable-summary> <summary-token-threshold>")?;
-            let enableSummary = parse_bool_arg(args.get(3), "usage: operit2 model summary-set <provider-id> <model-id> <enable-summary> <summary-token-threshold>")?;
-            let summaryTokenThreshold = parse_f32_arg(args.get(4), "usage: operit2 model summary-set <provider-id> <model-id> <enable-summary> <summary-token-threshold>")?;
+            let providerId = requiredArg(args, 1, usage)?;
+            let modelId = requiredArg(args, 2, usage)?;
+            let enableSummary = parse_bool_arg(args.get(3), usage)?;
+            let summaryTokenThreshold = parse_f32_arg(args.get(4), usage)?;
+            let current = command
+                .modelManager()
+                .getResolvedModelConfig(providerId, modelId)
+                .map_err(|error| error.to_string())?
+                .summary;
+            let summarySoftThresholdTokens = match args.get(5) {
+                Some(value) => Some(parse_i64_arg(Some(value), usage)?),
+                None => current.summarySoftThresholdTokens,
+            };
+            let summaryDebounceTokens = match args.get(6) {
+                Some(value) => Some(parse_i64_arg(Some(value), usage)?),
+                None => current.summaryDebounceTokens,
+            };
             let summary = ModelSummarySettings {
                 enableSummary,
                 summaryTokenThreshold,
+                summarySoftThresholdTokens,
+                summaryDebounceTokens,
             };
             let model = command
                 .modelManager()
@@ -990,9 +1023,9 @@ fn print_model_usage(output: &mut CoreCommandOutput) {
         "operit2 model parameters <provider-id> <model-id> <parameters-json>",
         "operit2 model builtin-tools <provider-id> <model-id> <builtin-tools-json>",
         "operit2 model context-show [provider-id] [model-id]",
-        "operit2 model context-set <provider-id> <model-id> <max-context-length>",
+        "operit2 model context-set <provider-id> <model-id> <max-context-length> [tool-result-inline-limit] [fold-middle-turns]",
         "operit2 model summary-show [provider-id] [model-id]",
-        "operit2 model summary-set <provider-id> <model-id> <enable-summary> <summary-token-threshold>",
+        "operit2 model summary-set <provider-id> <model-id> <enable-summary> <summary-token-threshold> [soft-threshold-tokens] [debounce-tokens]",
         "operit2 model thinking <provider-id> <model-id> [off|enabled|minimal|low|medium|high|xhigh|max]",
         "operit2 model function-list",
         "operit2 model function-show <function-type>",

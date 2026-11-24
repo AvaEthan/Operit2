@@ -1583,6 +1583,7 @@ impl ModelConfigManager {
             if model.contextOverride.is_none() {
                 model.contextOverride = Some(ModelContextSpec {
                     maxContextLength: model.localRuntime.llamaContextSize as f32 / 1000.0,
+                    ..ModelContextSpec::default()
                 });
             }
             if model.capabilitiesOverride.toolCall.is_none() {
@@ -2364,6 +2365,7 @@ mod tests {
             serde_json::to_value(ModelSummarySettings {
                 enableSummary: false,
                 summaryTokenThreshold: 0.92,
+                ..ModelSummarySettings::default()
             }).unwrap()
         );
         let exported: Vec<ProviderProfile> = serde_json::from_str(
@@ -2564,6 +2566,7 @@ mod tests {
                         Some(ModelListedSpec {
                             context: Some(ModelContextSpec {
                                 maxContextLength: context,
+                                ..ModelContextSpec::default()
                             }),
                             ..ModelListedSpec::default()
                         }),

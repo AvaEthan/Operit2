@@ -70,6 +70,7 @@ pub struct ModelsDevProviderModel {
 pub fn contextSpec(tokens: u64) -> ModelContextSpec {
     ModelContextSpec {
         maxContextLength: tokens as f32 / 1000.0,
+        ..ModelContextSpec::default()
     }
 }
 

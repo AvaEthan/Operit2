@@ -309,6 +309,8 @@ class _MenuBridge extends OperitRuntimeBridge {
           currentWindowSize: 123,
           inputTokenCount: 456,
           outputTokenCount: 789,
+          cachedInputTokens: 321,
+          latestAssistantInputTokens: 642,
           maxContextLength: 64,
         ).toJson();
       case 'getToolPkgPublicApiOwners':

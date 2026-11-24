@@ -39,6 +39,14 @@ impl MessagePartCodec {
 
     /// Serializes canonical parts for a text-only provider protocol boundary.
     pub fn assistantMarkup(parts: &[MessagePart]) -> String {
+        Self::assistantMarkupWithToolResultLimit(parts, None)
+    }
+
+    /// Serializes a provider view, replacing referenced oversized tool payloads with stable previews.
+    pub fn assistantMarkupWithToolResultLimit(
+        parts: &[MessagePart],
+        toolResultInlineLimit: Option<usize>,
+    ) -> String {
         let mut markup = String::new();
         for part in Self::orderedParts(parts) {
             match part.kind {
@@ -49,7 +57,25 @@ impl MessagePartCodec {
                     markup.push_str("</think>");
                 }
                 MessagePartKind::ToolCall => Self::appendToolCallMarkup(&mut markup, part),
-                MessagePartKind::ToolResult => Self::appendToolResultMarkup(&mut markup, part),
+                MessagePartKind::ToolResult => {
+                    let preview =
+                        toolResultInlineLimit
+                            .filter(|limit| *limit > 0)
+                            .and_then(|limit| {
+                                let hash = part.attributes.get("blob_hash")?;
+                                (is_tool_result_blob_hash(hash)
+                                    && part.content.chars().count() > limit)
+                                    .then(|| toolResultPreview(&part.content, hash, limit))
+                            });
+                    match preview {
+                        Some(content) => {
+                            let mut projected = part.clone();
+                            projected.content = content;
+                            Self::appendToolResultMarkup(&mut markup, &projected);
+                        }
+                        None => Self::appendToolResultMarkup(&mut markup, part),
+                    }
+                }
                 MessagePartKind::Status => Self::appendStatusMarkup(&mut markup, part),
             }
         }
@@ -142,11 +168,14 @@ impl MessagePartCodec {
         );
         part.toolName = attr_value(opening, "name");
         part.toolCallId = attr_value(opening, "call_id");
-        part.attributes = Self::openingAttributes(opening, &["status", "display", "result_data"]);
+        part.attributes = Self::openingAttributes(
+            opening,
+            &["status", "display", "result_data", "blob_hash"],
+        );
         for (start, end) in tag_ranges(&raw[opening.len()..], "content") {
             let content = &raw[opening.len() + start..opening.len() + end];
-            if let Some(body) = unfinishedTagBody(content, "content") {
-                part.content = body.to_string();
+            if let Some(body) = toolResultContentFromMarkup(content) {
+                part.content = body;
             }
         }
         part
@@ -157,10 +186,11 @@ impl MessagePartCodec {
         let tagName = ChatMarkupRegex::extract_opening_tag_name(raw)
             .ok_or_else(|| "tool result is missing an opening tag name".to_string())?;
         let body = Self::tagBody(raw, &tagName)?;
-        let payload = tag_ranges(&body, "content").into_iter().next()
-            .and_then(|(start, end)| unfinishedTagBody(&body[start..end], "content"))
-            .ok_or_else(|| "tool result is missing its content tag".to_string())?
-            .to_string();
+        let payload = tag_ranges(&body, "content")
+            .into_iter()
+            .next()
+            .and_then(|(start, end)| toolResultContentFromMarkup(&body[start..end]))
+            .ok_or_else(|| "tool result is missing its content tag".to_string())?;
         let toolName = attr_value(raw, "name")
             .ok_or_else(|| "tool result is missing its name attribute".to_string())?;
         let status = attr_value(raw, "status")
@@ -173,7 +203,7 @@ impl MessagePartCodec {
             status,
             payload,
         );
-        for name in ["display", "result_data"] {
+        for name in ["display", "result_data", "blob_hash"] {
             if let Some(value) = attr_value(raw, name) {
                 let decoded = value.replace("&quot;", "\"")
                     .replace("&apos;", "'")
@@ -259,14 +289,16 @@ impl MessagePartCodec {
             markup.push_str(&Self::escapeAttribute(callId));
             markup.push('\"');
         }
-        let providerAttributes = part.attributes.iter()
-            .filter(|(name, _)| !matches!(name.as_str(), "display" | "result_data"))
+        let providerAttributes = part
+            .attributes
+            .iter()
+            .filter(|(name, _)| !matches!(name.as_str(), "display" | "result_data" | "blob_hash"))
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect();
         Self::appendAttributes(markup, &providerAttributes);
-        markup.push_str("><content>");
-        markup.push_str(&part.content);
-        markup.push_str("</content></tool_result>");
+        markup.push('>');
+        markup.push_str(&toolResultContentMarkup(&part.content));
+        markup.push_str("</tool_result>");
     }
 
     /// Appends one structured status as protocol markup.
@@ -286,6 +318,140 @@ impl MessagePartCodec {
             .replace('<', "&lt;")
             .replace('>', "&gt;")
     }
+}
+
+/// Returns whether a value has the canonical SHA-256 blob-pointer shape.
+pub fn is_tool_result_blob_hash(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Wraps a tool payload, escaping only delimiter collisions that would truncate XML-like parsing.
+pub fn toolResultContentMarkup(content: &str) -> String {
+    let lower = content.to_ascii_lowercase();
+    if lower.contains("<content") || lower.contains("</content") {
+        let escaped = content
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        format!("<content encoding=\"xml\">{escaped}</content>")
+    } else {
+        format!("<content>{content}</content>")
+    }
+}
+
+/// Extracts and optionally decodes one complete or interrupted content tag.
+pub fn toolResultContentFromMarkup(raw: &str) -> Option<String> {
+    let (opening, tail) = raw.split_once('>')?;
+    let body = findAsciiCaseInsensitive(tail, "</content>")
+        .map_or(tail, |end| &tail[..end]);
+    let encoded = attr_value(opening, "encoding")
+        .is_some_and(|encoding| encoding.eq_ignore_ascii_case("xml"));
+    Some(if encoded {
+        body.replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&amp;", "&")
+    } else {
+        body.to_string()
+    })
+}
+
+/// Builds the deterministic send-view preview for one externalized tool result.
+pub fn toolResultPreview(content: &str, hash: &str, inlineLimit: usize) -> String {
+    let totalChars = content.chars().count();
+    if totalChars <= inlineLimit {
+        return content.to_string();
+    }
+    let marker = format!("[外置 {totalChars} 字符 hash={hash}，用 read_tool_result 取回]");
+    let markerChars = marker.chars().count();
+    if markerChars >= inlineLimit {
+        return marker.chars().take(inlineLimit).collect();
+    }
+    let available = inlineLimit - markerChars - 2;
+    let lines = content.lines().collect::<Vec<_>>();
+    let headCount = 20.min(lines.len());
+    let tailStart = headCount.max(lines.len().saturating_sub(10));
+    let headLines = &lines[..headCount];
+    let tailLines = &lines[tailStart..];
+    let selectedChars = headLines
+        .iter()
+        .chain(tailLines)
+        .map(|line| line.chars().count() + 1)
+        .sum::<usize>();
+    let (head, tail) = if selectedChars <= available {
+        (
+            headLines.join("\n"),
+            tailLines.join("\n"),
+        )
+    } else {
+        let headBudget = available * 2 / 3;
+        let tailBudget = available - headBudget;
+        let fallbackTailStart = lines.len().saturating_sub(10);
+        let fallbackTailLines = &lines[fallbackTailStart..];
+        (
+            previewHead(headLines, headBudget),
+            previewTail(fallbackTailLines, tailBudget),
+        )
+    };
+    let mut sections = Vec::with_capacity(3);
+    if !head.is_empty() {
+        sections.push(head);
+    }
+    sections.push(marker);
+    if !tail.is_empty() {
+        sections.push(tail);
+    }
+    sections.join("\n")
+}
+
+fn previewHead(lines: &[&str], budget: usize) -> String {
+    let mut result = String::new();
+    let mut remaining = budget;
+    for line in lines {
+        if remaining == 0 {
+            break;
+        }
+        if !result.is_empty() {
+            result.push('\n');
+            remaining -= 1;
+        }
+        let count = line.chars().count().min(remaining);
+        result.extend(line.chars().take(count));
+        remaining -= count;
+        if count < line.chars().count() {
+            break;
+        }
+    }
+    result
+}
+
+fn previewTail(lines: &[&str], budget: usize) -> String {
+    let mut result = String::new();
+    let mut remaining = budget;
+    for line in lines.iter().rev() {
+        if remaining == 0 {
+            break;
+        }
+        let count = line.chars().count().min(remaining);
+        let suffix = line
+            .chars()
+            .skip(line.chars().count() - count)
+            .collect::<String>();
+        if result.is_empty() {
+            result = suffix;
+        } else {
+            result = format!("{suffix}\n{result}");
+        }
+        remaining -= count;
+        if result.len() > 0 && remaining > 0 {
+            remaining -= 1;
+        }
+        if count < line.chars().count() {
+            break;
+        }
+    }
+    result
 }
 
 /// Incrementally converts an assistant response stream into canonical message parts.
@@ -710,7 +876,118 @@ fn asciiCaseInsensitiveSuffixPrefixLength(content: &str, closingTag: &str) -> us
 
 #[cfg(test)]
 mod tests {
-    use super::{AssistantMarkupStreamState, MessagePartCodec, MessagePartKind};
+    use super::{
+        AssistantMarkupStreamState, MessagePartCodec, MessagePartKind, is_tool_result_blob_hash,
+        toolResultPreview,
+    };
+
+    #[test]
+    fn tool_result_preview_is_deterministic_unicode_safe_and_bounded() {
+        let hash = "a".repeat(64);
+        let content = (0..50)
+            .map(|index| format!("第{index}行{}", "界".repeat(80)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let preview = toolResultPreview(&content, &hash, 4000);
+        assert_eq!(preview, toolResultPreview(&content, &hash, 4000));
+        assert!(preview.chars().count() <= 4000);
+        assert!(preview.starts_with("第0行"));
+        assert!(preview.ends_with(&format!("第49行{}", "界".repeat(80))));
+        assert!(preview.contains(&format!(
+            "[外置 {} 字符 hash={hash}",
+            content.chars().count()
+        )));
+        assert_eq!(toolResultPreview("短文", &hash, 4000), "短文");
+        assert!(is_tool_result_blob_hash(&hash));
+        assert!(!is_tool_result_blob_hash(&"a".repeat(63)));
+
+        let longLine = "界".repeat(10_000);
+        let bounded = toolResultPreview(&longLine, &hash, 500);
+        assert!(bounded.chars().count() <= 500);
+        assert!(bounded.starts_with(&"界".repeat(100)));
+        assert!(bounded.ends_with(&"界".repeat(100)));
+        assert!(bounded.contains("read_tool_result"));
+    }
+
+    #[test]
+    fn tool_result_content_delimiter_collisions_round_trip_without_truncation() {
+        let content = "before </content><content>middle &amp; 🦀</content> after";
+        let part = super::MessagePart::toolResult(
+            "part-0".into(),
+            0,
+            Some("call-1".into()),
+            "read_file".into(),
+            "success".into(),
+            content.into(),
+        );
+        let markup = MessagePartCodec::assistantMarkup(std::slice::from_ref(&part));
+        assert!(markup.contains("encoding=\"xml\""), "{markup}");
+        let parsed = MessagePartCodec::parseAssistantMarkup(&markup)
+            .unwrap_or_else(|error| panic!("{error}\n{markup}"));
+        let result = parsed
+            .iter()
+            .find(|part| part.kind == MessagePartKind::ToolResult)
+            .unwrap();
+        assert_eq!(result.content, content);
+    }
+
+    #[test]
+    fn tool_result_content_decoder_preserves_nested_and_unrelated_closing_tags() {
+        for (raw, expected) in [
+            (
+                "<content><error>failed</error></content>",
+                "<error>failed</error>",
+            ),
+            (
+                "<content>before </div> after</content>",
+                "before </div> after",
+            ),
+            ("<content>before </div> after", "before </div> after"),
+        ] {
+            assert_eq!(
+                super::toolResultContentFromMarkup(raw).as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn limited_markup_projects_only_oversized_referenced_results() {
+        let hash = "b".repeat(64);
+        let content = (0..40)
+            .map(|index| format!("line-{index}-{}", "x".repeat(200)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut part = super::MessagePart::toolResult(
+            "part-0".into(),
+            0,
+            Some("call-1".into()),
+            "read_file".into(),
+            "success".into(),
+            content.clone(),
+        );
+        part.attributes.insert("blob_hash".into(), hash.clone());
+        part.attributes
+            .insert("display".into(), "private-ui-metadata".into());
+        let full = MessagePartCodec::assistantMarkup(std::slice::from_ref(&part));
+        let projected =
+            MessagePartCodec::assistantMarkupWithToolResultLimit(&[part.clone()], Some(4000));
+        assert!(full.contains(&content));
+        assert!(!full.contains("blob_hash="));
+        assert!(!projected.contains("blob_hash="));
+        assert!(!projected.contains("private-ui-metadata"));
+        assert!(projected.contains("read_tool_result"));
+        assert!(projected.chars().count() < full.chars().count());
+        assert_eq!(part.content, content);
+        assert_eq!(
+            MessagePartCodec::assistantMarkupWithToolResultLimit(&[part.clone()], Some(0)),
+            full
+        );
+        assert_eq!(
+            MessagePartCodec::assistantMarkupWithToolResultLimit(&[part], None),
+            full
+        );
+    }
 
     /// Historical self-closing tags must survive import exactly, not reject a chat.
     #[test]

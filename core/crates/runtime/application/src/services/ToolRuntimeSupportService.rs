@@ -157,6 +157,32 @@ impl RuntimeToolSupport {
 }
 
 impl ToolRuntimeSupport for RuntimeToolSupport {
+    fn stageToolResultBlob(
+        &self,
+        chatId: String,
+        participantId: Option<String>,
+        extensionOwner: String,
+        content: String,
+    ) -> Result<String, String> {
+        self.runtimeChatHistoryManager()?
+            .stageToolResultBlob(chatId, participantId, extensionOwner, content)
+            .map_err(|error| error.to_string())
+    }
+
+    fn readToolResultBlob(
+        &self,
+        chatId: String,
+        participantId: Option<String>,
+        extensionOwner: String,
+        hash: String,
+        offset: usize,
+        limit: usize,
+    ) -> Result<String, String> {
+        self.runtimeChatHistoryManager()?
+            .readToolResultBlob(chatId, participantId, extensionOwner, hash, offset, limit)
+            .map_err(|error| error.to_string())
+    }
+
     /// Imports the v1 migrator's archive through the runtime's bound chat store.
     fn importV1MigratorArchive(&self, path: String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + '_>> {
         Box::pin(v1_chat_archive::import(self, path))

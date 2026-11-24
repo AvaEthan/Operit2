@@ -265,6 +265,7 @@ pub struct ToolExecutionBatch {
     pub results: Vec<ToolResult>,
     pub message: String,
     pub displayMessage: String,
+    pub blobHashes: Vec<Option<String>>,
     pub routeChangeIntent: Option<RouteChangeIntent>,
 }
 
@@ -274,8 +275,15 @@ impl ToolExecutionBatch {
         let message = ConversationMarkupManager::buildToolResultMessage(&results);
         let displayMessage = results.iter()
             .map(|result| ConversationMarkupManager::formatToolResultForDisplay(result, None))
-            .collect::<Vec<_>>().join("\n");
-        Self { results, message, displayMessage, routeChangeIntent }
+            .collect::<Vec<_>>()
+            .join("\n");
+        Self {
+            results,
+            message,
+            displayMessage,
+            blobHashes: Vec::new(),
+            routeChangeIntent,
+        }
     }
 }
 
@@ -379,6 +387,7 @@ impl ToolExecutionManager {
             executionData,
         };
         runtimeContext.validateExecutionContext()?;
+        let extensionOwner = runtimeContext.extensionOwner.clone();
         Self::scopeToolRuntimeContext(runtimeContext, async move {
         let mut results = Vec::new();
         let mut displays = Vec::new();
@@ -495,9 +504,33 @@ impl ToolExecutionManager {
             }
         }
 
+        let blobHashes: Vec<Option<String>> = if let Some(chatId) = callerChatId.as_deref() {
+            results
+                .iter()
+                .map(|result| {
+                    let content = ConversationMarkupManager::toolResultPayload(result);
+                    toolHandler
+                        .runtimeSupport()
+                        .stageToolResultBlob(
+                            chatId.into(),
+                            callerParticipantId.clone(),
+                            extensionOwner.clone(),
+                            content,
+                        )
+                        .map(Some)
+                        .map_err(|error| format!("Unable to stage tool result for continuation: {error}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            results.iter().map(|_| None).collect()
+        };
         let mut batch = ToolExecutionBatch::new(results, routeChangeIntent);
-        batch.displayMessage = batch.results.iter().zip(&displays)
-            .map(|(result, display)| ConversationMarkupManager::formatToolResultForDisplay(result, display.as_ref()))
+        batch.message = ConversationMarkupManager::buildToolResultMessageWithBlobHashes(&batch.results, &blobHashes);
+        batch.blobHashes = blobHashes;
+        batch.displayMessage = batch.results.iter().zip(&displays).enumerate()
+            .map(|(index, (result, display))| ConversationMarkupManager::formatToolResultForDisplayWithBlobHash(
+                result, display.as_ref(), batch.blobHashes.get(index).and_then(Option::as_deref),
+            ))
             .collect::<Vec<_>>().join("\n");
         AppLogger::v_with_level(
             TAG,

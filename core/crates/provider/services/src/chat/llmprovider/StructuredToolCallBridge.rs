@@ -1267,9 +1267,7 @@ fn extractFencedJsonBlocks(content: &str) -> Vec<String> {
 
 fn extractContentTag(content: &str) -> Option<String> {
     let (start, end) = tag_ranges(content, "content").into_iter().next()?;
-    let raw = &content[start..end];
-    raw.split_once('>')
-        .and_then(|(_, tail)| tail.rsplit_once("</").map(|(body, _)| body.to_string()))
+    operit_model::MessagePartCodec::toolResultContentFromMarkup(&content[start..end])
 }
 
 fn toBase36(mut value: u32) -> String {

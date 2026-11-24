@@ -1921,7 +1921,7 @@ impl ToolExecutor for FnToolExecutor {
 mod tests {
     use super::*;
     use crate::runtime_support::*;
-    use crate::ToolExecutionManager::{PreparedToolInvocation, ToolExposureMode, ToolRuntimeContext};
+    use crate::ToolExecutionManager::{PreparedToolInvocation, ToolExposureMode, ToolInvocation, ToolRuntimeContext};
     use operit_model::ToolPrompt::SystemToolPromptCategory;
     use std::future::Future;
     use std::pin::Pin;
@@ -1946,10 +1946,29 @@ mod tests {
 
 
     /// Rejects business dependencies so lifecycle tests cannot accidentally execute application services.
+    #[derive(Default)]
     struct UnusedRuntimeSupport {
         package_assets: Option<&'static [RuntimePluginAsset]>,
+        staged: Option<Arc<Mutex<Vec<(String, Option<String>, String, String)>>>>,
     }
     impl ToolRuntimeSupport for UnusedRuntimeSupport {
+        fn stageToolResultBlob(
+            &self,
+            chatId: String,
+            participantId: Option<String>,
+            extensionOwner: String,
+            content: String,
+        ) -> Result<String, String> {
+            if let Some(staged) = &self.staged {
+                staged.lock().unwrap().push((
+                    chatId,
+                    participantId,
+                    extensionOwner,
+                    content.clone(),
+                ));
+            }
+            Ok(operit_store::dao::MessagePartDao::toolResultBlobHash(&content))
+        }
         /// Rejects unexpected application service access in execution pipeline tests.
     fn bindCoreNodeToolRuntime(&self, runtime: Arc<dyn CoreNodeToolRuntime>) -> Result<(), String> { panic!("Unexpected runtime service: bindCoreNodeToolRuntime") }
         /// Rejects unexpected application service access in execution pipeline tests.
@@ -2193,7 +2212,7 @@ mod tests {
                         hostRuntimeTaskSchedulerHost: Some(operit_host_api::HostManager::defaultHostRuntimeTaskSchedulerHost()),
                         ..Default::default() },
                     runtimeDependencies: ToolRuntimeDependencies::new(
-                        Arc::new(UnusedRuntimeSupport { package_assets }),
+                        Arc::new(UnusedRuntimeSupport { package_assets, ..Default::default() }),
                         provider,
                     ),
                     hooks: Vec::new(), toolPermissionSystem: permissions, packageManager: None,
@@ -2510,7 +2529,7 @@ mod tests {
             ).unwrap();
             let tools = crate::tools::defaultTool::standard::StandardFileSystemTools::StandardFileSystemTools::new(
                 files.clone(), Arc::new(TransferTestHttp), None, storage,
-                Arc::new(UnusedRuntimeSupport { package_assets: None }),
+                Arc::new(UnusedRuntimeSupport { package_assets: None, ..Default::default() }),
             );
             Self { tools, files, root }
         }
@@ -3306,6 +3325,70 @@ mod tests {
         }
         let results = batch.await.unwrap().results;
         assert_eq!(results.iter().map(|result| result.result.toString()).collect::<Vec<_>>(), ["0", "1", "2"]);
+    }
+
+    #[tokio::test]
+    async fn tool_results_are_staged_with_caller_identity_before_continuation() {
+        let mut fixture = PipelineFixture::new();
+        let context = fixture.handler.getContext();
+        operit_store::RuntimeStorageHost::setDefaultRuntimeStorageHost(context.runtimeStorageHost.unwrap());
+        operit_store::RuntimeStorageHost::setDefaultRuntimeSqliteHost(context.runtimeSqliteHost.unwrap());
+        fixture.handler.getToolPermissionSystem().saveAiPermissionMode(AiPermissionMode::Full).unwrap();
+        fixture.handler.registerAsyncTool("blob_probe".into(), Box::new(AsyncFnToolExecutor {
+            validate: Arc::new(|_| ToolValidationResult { valid: true, errorMessage: String::new() }),
+            effect: ToolEffect::READ,
+            invoke: Arc::new(|tool, _| Box::pin(async move {
+                ToolResult {
+                    toolName: tool.name,
+                    success: true,
+                    result: stringResultData("full result".repeat(1000)),
+                    error: None,
+                }
+            })),
+        }));
+        let staged = Arc::new(Mutex::new(Vec::new()));
+        fixture.handler.inner.lock().unwrap().runtimeDependencies = ToolRuntimeDependencies::new(
+            Arc::new(UnusedRuntimeSupport {
+                package_assets: None,
+                staged: Some(staged.clone()),
+            }),
+            Arc::new(
+                operit_js_bridge::javascript::JsExecutionProvider::HostJsExecutionProvider::new(),
+            ),
+        );
+        let manager = RuntimePackageManager::new(RuntimeStorePaths::default(), fixture.handler.clone());
+        let invocations = vec![ToolInvocation {
+            tool: AITool { name: "blob_probe".into(), parameters: Vec::new() },
+            rawText: String::new(),
+            responseLocation: (0, 0),
+        }];
+        let batch = ToolExecutionManager::executeInvocations(
+            &invocations,
+            &mut fixture.handler,
+            &manager,
+            None,
+            Some("chat-a".into()),
+            Some("participant-a".into()),
+            None,
+            Vec::new(),
+            ToolExposureMode::FULL,
+            "configuration-owner".into(),
+            Default::default(),
+        ).await.unwrap();
+
+        let staged = staged.lock().unwrap();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].0, "chat-a");
+        assert_eq!(staged[0].1.as_deref(), Some("participant-a"));
+        assert_eq!(staged[0].2, "configuration-owner");
+        let payload = operit_tools::ConversationMarkupManager::ConversationMarkupManager::toolResultPayload(
+            &batch.results[0],
+        );
+        assert_eq!(staged[0].3, payload);
+        assert_eq!(
+            batch.blobHashes[0].as_deref(),
+            Some(operit_store::dao::MessagePartDao::toolResultBlobHash(&payload).as_str())
+        );
     }
 
     /// Runs Promise.all through the real native JS bridge and repeated ordinary tool dispatch.

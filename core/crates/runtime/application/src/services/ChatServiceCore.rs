@@ -133,6 +133,10 @@ pub struct ChatInputMenuSummary {
     pub currentWindowSize: i64,
     pub inputTokenCount: i64,
     pub outputTokenCount: i64,
+    #[serde(default)]
+    pub cachedInputTokens: i64,
+    #[serde(default)]
+    pub latestAssistantInputTokens: i64,
     pub maxContextLength: f64,
 }
 
@@ -531,7 +535,7 @@ impl ChatServiceCore {
                     .into_iter()
                     .find(|chat| chat.id == chatId)
                 {
-                    delegate.tokenStatisticsDelegate.setTokenCounts(
+                    delegate.tokenStatisticsDelegate.syncPersistedTokenCounts(
                         Some(chat.id),
                         chat.inputTokens,
                         chat.outputTokens,
@@ -1553,6 +1557,7 @@ impl ChatServiceCore {
             &configuration,
             None,
             None,
+            false,
         )
         .await
         .map_err(|error| error.to_string())
@@ -3022,18 +3027,36 @@ impl ChatServiceCore {
         let config = ModelConfigManager::default()
             .getResolvedModelConfig(&binding.providerId, &binding.modelId)
             .map_err(|e| e.to_string())?;
-        let chat = match chatId {
+        let chat = match chatId.as_ref() {
             Some(id) => self
                 .chatHistoryDelegate
                 .chatHistoryManager
-                .loadChatHistory(id)
+                .loadChatHistory(id.clone())
+                .map_err(|e| e.to_string())?,
+            None => None,
+        };
+        let liveWindowSize = self
+            .getTokenStatisticsDelegate()
+            .map(|delegate| delegate.getLastCurrentWindowSize(chatId.clone()))
+            .unwrap_or(0);
+        let latestAssistantUsage = match chatId.as_deref() {
+            Some(id) => self
+                .chatHistoryDelegate
+                .chatHistoryManager
+                .loadLatestAssistantTokenUsage(id)
                 .map_err(|e| e.to_string())?,
             None => None,
         };
         Ok(ChatInputMenuSummary {
-            currentWindowSize: chat.as_ref().map(|c| c.currentWindowSize).unwrap_or(0),
+            currentWindowSize: if liveWindowSize > 0 {
+                liveWindowSize
+            } else {
+                chat.as_ref().map(|c| c.currentWindowSize).unwrap_or(0)
+            },
             inputTokenCount: chat.as_ref().map(|c| c.inputTokens).unwrap_or(0),
             outputTokenCount: chat.as_ref().map(|c| c.outputTokens).unwrap_or(0),
+            cachedInputTokens: latestAssistantUsage.map(|(_, cached)| cached).unwrap_or(0),
+            latestAssistantInputTokens: latestAssistantUsage.map(|(input, _)| input).unwrap_or(0),
             maxContextLength: f64::from(config.context.maxContextLength),
         })
     }
@@ -3561,6 +3584,25 @@ fn authorizeChatImage(messages: &[ChatMessage], id: &str) -> Result<(), String> 
         return Err("Image is not referenced by this chat".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod chat_input_menu_summary_tests {
+    use super::*;
+
+    #[test]
+    fn older_peers_default_to_zero_cached_input_tokens() {
+        let summary: ChatInputMenuSummary = serde_json::from_value(serde_json::json!({
+            "currentWindowSize": 123,
+            "inputTokenCount": 456,
+            "outputTokenCount": 789,
+            "maxContextLength": 64.0,
+        }))
+        .unwrap();
+
+        assert_eq!(summary.cachedInputTokens, 0);
+        assert_eq!(summary.latestAssistantInputTokens, 0);
+    }
 }
 
 #[cfg(test)]

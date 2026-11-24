@@ -47,10 +47,14 @@ impl MessageDao {
                 &format!("SELECT * FROM message_variants WHERE chatId = ? AND messageTimestamp IN ({placeholders}) ORDER BY messageTimestamp, variantIndex"),
                 params.clone(),
             )?.iter().map(mapMessageVariantEntity).collect::<Result<_, _>>()?;
-            let parts = transaction.queryRows(
+            let mut parts = transaction.queryRows(
                 &format!("SELECT * FROM message_parts WHERE chatId = ? AND messageTimestamp IN ({placeholders}) ORDER BY messageTimestamp, variantIndex, sequence"),
                 params,
-            )?.iter().map(mapMessagePartEntity).collect::<Result<_, _>>()?;
+            )?.iter().map(mapMessagePartEntity).collect::<Result<Vec<_>, _>>()?;
+            crate::dao::MessagePartDao::normalizeToolResultBlobsInTransaction(
+                &mut *transaction,
+                &mut parts,
+            )?;
             Ok(MessageSnapshot { messages, variants, parts })
         })
     }
@@ -71,6 +75,28 @@ impl MessageDao {
             "SELECT COUNT(*) FROM messages WHERE chatId = ?1 AND (?2 IS NULL OR timestamp <= ?2)",
             sqliteParams![chatId, upToTimestampInclusive],
         )
+    }
+
+    /// Reads the latest assistant request usage without hydrating message content.
+    pub fn getLatestAssistantTokenUsage(
+        &self,
+        chatId: &str,
+    ) -> Result<Option<(i64, i64)>, SqliteStoreError> {
+        self.store
+            .queryOne(
+                r#"SELECT COALESCE(v.inputTokens, m.inputTokens),
+                          COALESCE(v.cachedInputTokens, m.cachedInputTokens)
+                   FROM messages m
+                   LEFT JOIN message_variants v
+                     ON v.chatId = m.chatId
+                    AND v.messageTimestamp = m.timestamp
+                    AND v.variantIndex = m.selectedVariantIndex
+                   WHERE m.chatId = ?1 AND m.sender = 'ai'
+                   ORDER BY m.timestamp DESC LIMIT 1"#,
+                sqliteParams![chatId],
+            )?
+            .map(|row| Ok((row.get(0)?, row.get(1)?)))
+            .transpose()
     }
 
     /// Counts later messages without materializing their identities or content.

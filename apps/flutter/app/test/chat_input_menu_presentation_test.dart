@@ -892,6 +892,8 @@ class _ContextBridge extends OperitRuntimeBridge {
           currentWindowSize: 0,
           inputTokenCount: 0,
           outputTokenCount: 0,
+          cachedInputTokens: 0,
+          latestAssistantInputTokens: 0,
           maxContextLength: 32,
         ).toJson();
       case 'getToolPkgPublicApiOwners':

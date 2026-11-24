@@ -5154,7 +5154,12 @@ class _ModelInlineSettingsFormState extends State<_ModelInlineSettingsForm> {
       () => widget.clients.preferencesModelConfigManager.updateContextForModel(
         providerId: widget.provider.id,
         modelId: widget.model.id,
-        context: core_proxy.ModelContextSpec(maxContextLength: value),
+        context: core_proxy.ModelContextSpec(
+          maxContextLength: value,
+          toolResultInlineLimit:
+              widget.initialConfig.context.toolResultInlineLimit,
+          foldMiddleTurns: widget.initialConfig.context.foldMiddleTurns,
+        ),
       ),
       undo: () {
         _savedContext = previous;
@@ -5200,6 +5205,10 @@ class _ModelInlineSettingsFormState extends State<_ModelInlineSettingsForm> {
         summary: core_proxy.ModelSummarySettings(
           enableSummary: enabled,
           summaryTokenThreshold: ratio,
+          summarySoftThresholdTokens:
+              widget.initialConfig.summary.summarySoftThresholdTokens,
+          summaryDebounceTokens:
+              widget.initialConfig.summary.summaryDebounceTokens,
         ),
       ),
       undo: () {

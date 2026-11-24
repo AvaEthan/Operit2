@@ -220,6 +220,10 @@ pub struct ChatConfigurationResult {
     pub historyPolicy: ChatHistoryPolicy,
     pub profile: ChatParticipantProfile,
     pub participants: Vec<ChatParticipantProfile>,
+    #[serde(default = "default_tool_result_inline_limit")]
+    pub toolResultInlineLimit: i64,
+    #[serde(default)]
+    pub foldMiddleTurns: bool,
     /// Contains owner-isolated data for the current execution only; never persisted on messages.
     pub executionData: JsonObject,
     /// Identifies the actual registered owner injected by Rust after authenticated dispatch.
@@ -227,9 +231,22 @@ pub struct ChatConfigurationResult {
     pub extensionOwner: String,
 }
 
+fn default_tool_result_inline_limit() -> i64 {
+    operit_model::ModelConfigData::ModelConfigDefaults::DEFAULT_TOOL_RESULT_INLINE_LIMIT
+}
+
 impl ChatConfigurationResult {
+    #[allow(non_snake_case)]
+    pub fn toolResultInlineLimitChars(&self) -> Option<usize> {
+        (self.toolResultInlineLimit > 0)
+            .then(|| usize::try_from(self.toolResultInlineLimit).unwrap_or(usize::MAX))
+    }
+
     /// Rejects malformed plugin descriptors before any model, speech or tool execution begins.
     pub fn validate(&self) -> Result<(), String> {
+        if self.toolResultInlineLimit < 0 {
+            return Err("Chat tool result inline limit cannot be negative".to_string());
+        }
         if self.contextKey.trim().is_empty() {
             return Err("Chat configuration contextKey is empty".to_string());
         }

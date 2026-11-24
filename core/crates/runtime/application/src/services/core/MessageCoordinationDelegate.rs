@@ -6,14 +6,18 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 
 use crate::core::chat::AIMessageManager::{AIMessageManager, StableContextWindowRequest};
+use crate::services::ProviderRuntimeSupportService::{
+    ChatConfigurationApi, MODEL_CONFIGURATION_OWNER,
+};
 use crate::services::core::ChatHistoryDelegate::ChatHistoryDelegate;
 use crate::services::core::MessageProcessingDelegate::ChatTurnSubmission;
 use crate::services::core::MessageProcessingDelegate::{
     ChatSummaryTask, MessageProcessingDelegate, RegenerateAiMessageVariantRequest,
     SendUserMessageProcessingRequest,
 };
-use crate::services::core::TokenStatisticsDelegate::TokenStatisticsDelegate;
-use crate::services::ProviderRuntimeSupportService::{ChatConfigurationApi, MODEL_CONFIGURATION_OWNER};
+use crate::services::core::TokenStatisticsDelegate::{
+    TokenCountsWriteError, TokenStatisticsDelegate,
+};
 use operit_host_api::HostManager::defaultHostRuntimeTaskSchedulerHost;
 use operit_host_api::HostRuntimeTaskSchedulerHost;
 use operit_host_api::TimeUtils::currentTimeMillis;
@@ -55,6 +59,7 @@ struct ConversationSummaryRequest {
     chatProviderIdOverride: Option<String>,
     chatModelIdOverride: Option<String>,
     autoContinue: bool,
+    preserveRecentTurns: bool,
     requireCurrentChat: bool,
     trigger: Option<SummaryTriggerContext>,
 }
@@ -85,6 +90,28 @@ impl SummarySendPolicy {
                 && !turnOptions.deferSummary,
         }
     }
+}
+
+fn shouldGenerateIncrementalSummary(
+    incrementalTokens: i64,
+    maxTokens: i32,
+    hasPreviousSummary: bool,
+    settings: &ModelSummarySettings,
+) -> bool {
+    let debounceAllows = !hasPreviousSummary
+        || settings
+            .debounceTokens()
+            .is_none_or(|threshold| incrementalTokens >= threshold);
+    let softExceeded = settings
+        .softThresholdTokens()
+        .is_some_and(|threshold| incrementalTokens >= threshold);
+    let ratioExceeded = AIMessageManager::shouldGenerateSummary(
+        incrementalTokens,
+        maxTokens,
+        settings.tokenThresholdRatio(),
+        true,
+    );
+    settings.enableSummary && debounceAllows && (softExceeded || ratioExceeded)
 }
 
 /// Coordinates high-level chat sends, generic participant execution and conversation summaries.
@@ -252,6 +279,36 @@ impl MessageCoordinationDelegate {
             chatModelIdOverride.or_else(|| self.currentChatModelIdOverride.clone());
         let effectiveChatProviderIdOverride =
             chatProviderIdOverride.or_else(|| self.currentChatProviderIdOverride.clone());
+        let windowRevision = self
+            .tokenStatisticsDelegate
+            .getWindowRevision(Some(targetChatId.clone()));
+        let baselineChat = match self
+            .chatHistoryDelegate
+            .chatHistoryManager
+            .loadChatHistory(targetChatId.clone())
+        {
+            Ok(Some(chat)) => chat,
+            Ok(None) => {
+                self.messageProcessingDelegate
+                    .setInputProcessingStateForChat(
+                        targetChatId,
+                        InputProcessingState::Error {
+                            message: "Chat does not exist for context estimation".to_string(),
+                        },
+                    );
+                return None;
+            }
+            Err(error) => {
+                self.messageProcessingDelegate
+                    .setInputProcessingStateForChat(
+                        targetChatId,
+                        InputProcessingState::Error {
+                            message: error.to_string(),
+                        },
+                    );
+                return None;
+            }
+        };
         let newWindowSize = match self
             .recalculateStableWindowSize(
                 service,
@@ -278,31 +335,62 @@ impl MessageCoordinationDelegate {
                 return None;
             }
         };
-        let chat = match self
-            .chatHistoryDelegate
-            .chatHistoryManager
-            .updateChatContextWindow(targetChatId.clone(), newWindowSize)
-        {
-            Ok(chat) => chat,
-            Err(error) => {
+        match self.tokenStatisticsDelegate.persistTokenCountsIfRevision(
+            Some(targetChatId.clone()),
+            newWindowSize,
+            windowRevision,
+            || {
+                self.chatHistoryDelegate
+                    .chatHistoryManager
+                    .updateChatContextWindowIfCurrent(
+                        targetChatId.clone(),
+                        newWindowSize,
+                        baselineChat.inputTokens,
+                        baselineChat.outputTokens,
+                        baselineChat.currentWindowSize,
+                        baselineChat.updatedAt,
+                    )
+                    .map(|chat| chat.map(|chat| (chat.inputTokens, chat.outputTokens)))
+                    .map_err(|error| error.to_string())
+            },
+        ) {
+            Ok(Some(_)) => Some(newWindowSize),
+            Ok(None) => {
+                ChainLogger::verbose(
+                    SEND_CHAIN,
+                    "stable_window.recalculate.superseded",
+                    &[("chatId", targetChatId.clone())],
+                );
+                let persistedWindow = self
+                    .chatHistoryDelegate
+                    .chatHistoryManager
+                    .loadChatHistory(targetChatId.clone())
+                    .ok()
+                    .flatten()
+                    .map(|chat| chat.currentWindowSize)
+                    .unwrap_or(baselineChat.currentWindowSize);
+                let liveWindow = self
+                    .tokenStatisticsDelegate
+                    .getLastCurrentWindowSize(Some(targetChatId));
+                Some(if liveWindow > 0 {
+                    liveWindow
+                } else {
+                    persistedWindow
+                })
+            }
+            Err(TokenCountsWriteError::Superseded) => Some(
+                self.tokenStatisticsDelegate
+                    .getLastCurrentWindowSize(Some(targetChatId)),
+            ),
+            Err(TokenCountsWriteError::Persistence(error)) => {
                 self.messageProcessingDelegate
                     .setInputProcessingStateForChat(
                         targetChatId,
-                        InputProcessingState::Error {
-                            message: error.to_string(),
-                        },
+                        InputProcessingState::Error { message: error },
                     );
-                return None;
+                None
             }
-        };
-        let (inputTokens, outputTokens) = (chat.inputTokens, chat.outputTokens);
-        self.tokenStatisticsDelegate.setTokenCounts(
-            Some(targetChatId.clone()),
-            inputTokens,
-            outputTokens,
-            newWindowSize,
-        );
-        Some(newWindowSize)
+        }
     }
 
     /// Public entry point for sending a user message from the active chat UI.
@@ -700,17 +788,20 @@ impl MessageCoordinationDelegate {
                 return Err(error.to_string());
             }
         };
-        let isBackgroundSend = self.chatHistoryDelegate.currentChatIdFlow.value().as_ref() != Some(&chatId);
-        let (maxTokens, tokenUsageThreshold) = self.prepareSummaryForSend(
-            enhancedAiService,
-            &configuration,
-            &chatId,
-            participantId.clone(),
-            promptFunctionType.clone(),
-            &turnOptions,
-            !isContinuation && !isAutoContinuation && !isResume,
-            isBackgroundSend,
-        )?;
+        let isBackgroundSend =
+            self.chatHistoryDelegate.currentChatIdFlow.value().as_ref() != Some(&chatId);
+        let (maxTokens, tokenUsageThreshold) = self
+            .prepareSummaryForSend(
+                enhancedAiService,
+                &configuration,
+                &chatId,
+                participantId.clone(),
+                promptFunctionType.clone(),
+                &turnOptions,
+                !isContinuation && !isAutoContinuation && !isResume,
+                isBackgroundSend,
+            )
+            .await?;
         let runtimeChatHistory = match chatHistoryOverride {
             Some(history) => history,
             None => self
@@ -782,9 +873,9 @@ impl MessageCoordinationDelegate {
 
     /// Starts snapshot compaction without delaying dispatch and retains the tool-round token guard.
     #[allow(clippy::too_many_arguments)]
-    fn prepareSummaryForSend(
+    async fn prepareSummaryForSend(
         &mut self,
-        enhancedAiService: &EnhancedAIService,
+        enhancedAiService: &mut EnhancedAIService,
         configuration: &ChatConfigurationResult,
         chatId: &str,
         participantId: Option<String>,
@@ -813,43 +904,88 @@ impl MessageCoordinationDelegate {
             let messages = self
                 .chatHistoryDelegate
                 .getRuntimeChatHistory(chatId.to_string());
-            let chat = self
-                .chatHistoryDelegate
-                .chatHistoryManager
-                .loadChatHistory(chatId.to_string())
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| format!("Chat does not exist: {chatId}"))?;
-            if !messages.is_empty()
-                && AIMessageManager::shouldGenerateSummary(
-                    chat.currentWindowSize,
-                    maxTokens,
-                    policy.tokenUsageThreshold,
-                    true,
-                )
-            {
-                let _summaryCompletion = self.launchSummary(
+            let lastSummaryIndex = messages
+                .iter()
+                .rposition(|message| message.sender == "summary");
+            if AIMessageManager::summaryInsertPosition(&messages, lastSummaryIndex, true).is_some() {
+                let incrementalTokens = Self::estimateIncrementalSummaryTokens(
                     enhancedAiService,
-                    messages,
-                    ConversationSummaryRequest {
-                        chatId: chatId.to_string(),
-                        configuration: configuration.clone(),
-                        participantId,
-                        promptFunctionType,
-                        chatProviderIdOverride: Some(providerId),
-                        chatModelIdOverride: Some(modelId),
-                        autoContinue: false,
-                        requireCurrentChat: true,
-                        trigger: Some(SummaryTriggerContext {
-                            current_tokens: chat.currentWindowSize,
-                            max_tokens: maxTokens,
-                            token_usage_threshold: policy.tokenUsageThreshold,
-                            trigger_point: SummaryTriggerPoint::BeforeSend,
-                        }),
-                    },
-                )?;
+                    configuration,
+                    &messages,
+                    participantId
+                        .as_deref()
+                        .unwrap_or(&configuration.profile.id),
+                    chatId,
+                )
+                .await?;
+                let hasPreviousSummary = messages.iter().any(|message| message.sender == "summary");
+                if shouldGenerateIncrementalSummary(
+                    incrementalTokens,
+                    maxTokens,
+                    hasPreviousSummary,
+                    &settings.summary,
+                ) {
+                    let _summaryCompletion = self.launchSummary(
+                        enhancedAiService,
+                        messages,
+                        ConversationSummaryRequest {
+                            chatId: chatId.to_string(),
+                            configuration: configuration.clone(),
+                            participantId,
+                            promptFunctionType,
+                            chatProviderIdOverride: Some(providerId),
+                            chatModelIdOverride: Some(modelId),
+                            autoContinue: false,
+                            preserveRecentTurns: true,
+                            requireCurrentChat: true,
+                            trigger: Some(SummaryTriggerContext {
+                                current_tokens: incrementalTokens,
+                                max_tokens: maxTokens,
+                                token_usage_threshold: policy.tokenUsageThreshold,
+                                trigger_point: SummaryTriggerPoint::BeforeSend,
+                            }),
+                        },
+                    )?;
+                }
             }
         }
         Ok((maxTokens, policy.tokenUsageThreshold))
+    }
+
+    async fn estimateIncrementalSummaryTokens(
+        service: &mut EnhancedAIService,
+        configuration: &ChatConfigurationResult,
+        messages: &[ChatMessage],
+        participantId: &str,
+        chatId: &str,
+    ) -> Result<i64, String> {
+        let lastSummaryIndex = messages
+            .iter()
+            .rposition(|message| message.sender == "summary");
+        let start = AIMessageManager::summaryAccountingStart(messages, lastSummaryIndex);
+        let incremental = messages[start..]
+            .iter()
+            .filter(|message| message.sender == "user" || message.sender == "ai")
+            .cloned()
+            .collect::<Vec<_>>();
+        if incremental.is_empty() {
+            return Ok(0);
+        }
+        let turns = AIMessageManager::getMemoryFromMessages(incremental, configuration)
+            .map_err(|error| error.to_string())?;
+        let options = SendMessageOptions {
+            chatId: Some(chatId.to_string()),
+            executionParticipantId: Some(participantId.to_string()),
+            promptFunctionType: PromptFunctionType::CHAT,
+            ..SendMessageOptions::new()
+        };
+        let runtime = service
+            .createSendMessageRuntime(&options, configuration.clone())
+            .map_err(|error| error.to_string())?;
+        service
+            .estimatePreparedRequestWindow(runtime.aiService.clone(), &turns, &[], Some(chatId.to_string()), false)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     /// Checks the completed conversation against every current participant's configured summary threshold.
@@ -859,34 +995,78 @@ impl MessageCoordinationDelegate {
         if let Some(task) = self.messageProcessingDelegate.summaryTaskForChat(&chatId) {
             task.completion.await?;
         }
-        let configuration = service.resolveChatConfigurationForOptions(&SendMessageOptions {
-            chatId: Some(chatId.clone()), executionParticipantId: Some(participantId),
-            ..SendMessageOptions::new()
-        }).await.map_err(|error| error.to_string())?;
-        let window = self.recalculateStableWindowSize(
-            service, chatId.clone(), None, PromptFunctionType::CHAT, None, None,
-        ).await?;
-        let messages = self.chatHistoryDelegate.getRuntimeChatHistory(chatId.clone());
+        let configuration = service
+            .resolveChatConfigurationForOptions(&SendMessageOptions {
+                chatId: Some(chatId.clone()),
+                executionParticipantId: Some(participantId),
+                ..SendMessageOptions::new()
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        let messages = self
+            .chatHistoryDelegate
+            .getRuntimeChatHistory(chatId.clone());
+        let hasPreviousSummary = messages.iter().any(|message| message.sender == "summary");
+        let lastSummaryIndex = messages
+            .iter()
+            .rposition(|message| message.sender == "summary");
+        if AIMessageManager::summaryInsertPosition(&messages, lastSummaryIndex, true).is_none() {
+            return Ok(());
+        }
         for participant in &configuration.participants {
-            let settings = self.messageProcessingDelegate.modelConfigManager.getResolvedModelConfig(
-                &participant.modelBinding.providerId, &participant.modelBinding.modelId,
-            ).map_err(|error| error.to_string())?;
-            if AIMessageManager::shouldGenerateSummary(
-                window, settings.context.maxContextTokens(),
-                settings.summary.tokenThresholdRatio(), settings.summary.enableSummary,
+            let participantConfiguration = service
+                .resolveChatConfigurationForOptions(&SendMessageOptions {
+                    chatId: Some(chatId.clone()),
+                    executionParticipantId: Some(participant.id.clone()),
+                    ..SendMessageOptions::new()
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            let settings = self
+                .messageProcessingDelegate
+                .modelConfigManager
+                .getResolvedModelConfig(
+                    &participant.modelBinding.providerId,
+                    &participant.modelBinding.modelId,
+                )
+                .map_err(|error| error.to_string())?;
+            let incrementalTokens = Self::estimateIncrementalSummaryTokens(
+                service,
+                &participantConfiguration,
+                &messages,
+                &participant.id,
+                &chatId,
+            )
+            .await?;
+            if shouldGenerateIncrementalSummary(
+                incrementalTokens,
+                settings.context.maxContextTokens(),
+                hasPreviousSummary,
+                &settings.summary,
             ) {
-                return self.launchSummary(service, messages, ConversationSummaryRequest {
-                    chatId, participantId: Some(configuration.profile.id.clone()),
-                    configuration: configuration.clone(), promptFunctionType: PromptFunctionType::CHAT,
-                    chatProviderIdOverride: None, chatModelIdOverride: None,
-                    autoContinue: false, requireCurrentChat: false,
-                    trigger: Some(SummaryTriggerContext {
-                        current_tokens: window,
-                        max_tokens: settings.context.maxContextTokens(),
-                        token_usage_threshold: settings.summary.tokenThresholdRatio(),
-                        trigger_point: SummaryTriggerPoint::AfterReply,
-                    }),
-                })?.await;
+                return self
+                    .launchSummary(
+                        service,
+                        messages,
+                        ConversationSummaryRequest {
+                            chatId,
+                            participantId: Some(participant.id.clone()),
+                            configuration: participantConfiguration,
+                            promptFunctionType: PromptFunctionType::CHAT,
+                            chatProviderIdOverride: None,
+                            chatModelIdOverride: None,
+                            autoContinue: false,
+                            preserveRecentTurns: true,
+                            requireCurrentChat: false,
+                            trigger: Some(SummaryTriggerContext {
+                                current_tokens: incrementalTokens,
+                                max_tokens: settings.context.maxContextTokens(),
+                                token_usage_threshold: settings.summary.tokenThresholdRatio(),
+                                trigger_point: SummaryTriggerPoint::AfterReply,
+                            }),
+                        },
+                    )?
+                    .await;
             }
         }
         Ok(())
@@ -918,6 +1098,12 @@ impl MessageCoordinationDelegate {
             .boxed()
             .shared();
         let taskId = Arc::new(());
+        let startedAt = currentTimeMillis();
+        ChainLogger::verbose(
+            SEND_CHAIN,
+            "chat.summary.started",
+            &[("chatId", chatId.clone())],
+        );
         self.messageProcessingDelegate.registerSummaryTask(
             chatId.clone(),
             ChatSummaryTask {
@@ -992,6 +1178,15 @@ impl MessageCoordinationDelegate {
                             Err("Conversation summary cancelled".to_string())
                         }
                     };
+                    ChainLogger::verbose(
+                        SEND_CHAIN,
+                        "chat.summary.finished",
+                        &[
+                            ("chatId", workerChatId.clone()),
+                            ("result", if result.is_ok() { "ok" } else { "error" }.to_string()),
+                            ("elapsedMs", (currentTimeMillis() - startedAt).to_string()),
+                        ],
+                    );
                     worker
                         .messageProcessingDelegate
                         .finishSummaryTask(&workerChatId, &workerTaskId);
@@ -1022,9 +1217,17 @@ impl MessageCoordinationDelegate {
         request: ConversationSummaryRequest,
         progress: Option<operit_providers::chat::enhance::ConversationService::SummaryProgressCallback>,
     ) -> Result<(), String> {
-        let insertPosition = self
-            .chatHistoryDelegate
-            .findProperSummaryPosition(messages.clone());
+        let lastSummaryIndex = messages
+            .iter()
+            .rposition(|message| message.sender == "summary");
+        let summarizedThrough = messages.last().map(|message| message.timestamp);
+        let Some(insertPosition) = AIMessageManager::summaryInsertPosition(
+            &messages,
+            lastSummaryIndex,
+            request.preserveRecentTurns,
+        ) else {
+            return Ok(());
+        };
         let beforeTimestamp = insertPosition
             .checked_sub(1)
             .and_then(|index| messages.get(index))
@@ -1032,24 +1235,51 @@ impl MessageCoordinationDelegate {
         let afterTimestamp = messages
             .get(insertPosition)
             .map(|message| message.timestamp);
-        let summary =
-            AIMessageManager::summarizeMemory(
-                enhancedAiService, messages, request.autoContinue, request.chatId.clone(), &request.configuration, progress, request.trigger,
-            )
-                .await
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| "No valid conversation summary was generated".to_string())?;
+        let retainedBaseline = if request.preserveRecentTurns {
+            messages[insertPosition..].to_vec()
+        } else {
+            Vec::new()
+        };
+        let mut summary = AIMessageManager::summarizeMemory(
+            enhancedAiService,
+            messages,
+            request.autoContinue,
+            request.chatId.clone(),
+            &request.configuration,
+            progress,
+            request.trigger,
+            request.preserveRecentTurns,
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "No valid conversation summary was generated".to_string())?;
         if request.requireCurrentChat
             && self.chatHistoryDelegate.currentChatIdFlow.value().as_ref() != Some(&request.chatId)
         {
             return Ok(());
         }
-        self.chatHistoryDelegate.addSummaryMessage(
-            summary,
-            beforeTimestamp,
-            afterTimestamp,
-            Some(request.chatId.clone()),
+        AIMessageManager::markSummaryAccountingBaseline(
+            &mut summary,
+            summarizedThrough,
+            &retainedBaseline,
         );
+        if self
+            .chatHistoryDelegate
+            .addSummaryMessage(
+                summary,
+                beforeTimestamp,
+                afterTimestamp,
+                Some(request.chatId.clone()),
+            )
+            .is_none()
+        {
+            ChainLogger::verbose(
+                SEND_CHAIN,
+                "chat.summary.checkpoint.superseded",
+                &[("chatId", request.chatId)],
+            );
+            return Ok(());
+        }
         self.refreshStableContextWindow(
             enhancedAiService,
             Some(request.chatId),
@@ -1104,6 +1334,7 @@ impl MessageCoordinationDelegate {
                 chatProviderIdOverride: self.currentChatProviderIdOverride.clone(),
                 chatModelIdOverride: self.currentChatModelIdOverride.clone(),
                 autoContinue: false,
+                preserveRecentTurns: false,
                 requireCurrentChat: false,
                 trigger: None,
             },
@@ -1166,6 +1397,7 @@ impl MessageCoordinationDelegate {
                 chatProviderIdOverride: request.chatProviderIdOverride.clone(),
                 chatModelIdOverride: request.chatModelIdOverride.clone(),
                 autoContinue: true,
+                preserveRecentTurns: false,
                 requireCurrentChat: false,
                 trigger: None,
             },
@@ -1277,6 +1509,66 @@ mod summary_send_policy_tests {
         assert!(!continued.checkBeforeSend);
         assert_eq!(initial.tokenUsageThreshold, continued.tokenUsageThreshold);
         assert!(initial.tokenUsageThreshold <= 1.0);
+    }
+
+    #[test]
+    fn incremental_summary_uses_the_same_scope_for_soft_and_ratio_thresholds() {
+        let settings = ModelSummarySettings {
+            summaryTokenThreshold: 0.1,
+            ..ModelSummarySettings::default()
+        };
+        assert!(!shouldGenerateIncrementalSummary(
+            9_999, 100_000, false, &settings
+        ));
+        assert!(shouldGenerateIncrementalSummary(
+            10_000, 100_000, false, &settings
+        ));
+        assert!(shouldGenerateIncrementalSummary(
+            12_000, 200_000, false, &settings
+        ));
+
+        let softDisabled = ModelSummarySettings {
+            summarySoftThresholdTokens: Some(0),
+            ..settings
+        };
+        assert!(!shouldGenerateIncrementalSummary(
+            9_999,
+            100_000,
+            false,
+            &softDisabled
+        ));
+        assert!(shouldGenerateIncrementalSummary(
+            10_000,
+            100_000,
+            false,
+            &softDisabled
+        ));
+    }
+
+    #[test]
+    fn incremental_summary_debounces_only_after_an_existing_checkpoint() {
+        let settings = ModelSummarySettings {
+            summaryTokenThreshold: 0.0,
+            summarySoftThresholdTokens: Some(0),
+            ..ModelSummarySettings::default()
+        };
+        assert!(shouldGenerateIncrementalSummary(
+            1, 100_000, false, &settings
+        ));
+        assert!(!shouldGenerateIncrementalSummary(
+            1_999, 100_000, true, &settings
+        ));
+        assert!(shouldGenerateIncrementalSummary(
+            2_000, 100_000, true, &settings
+        ));
+
+        let disabled = ModelSummarySettings {
+            summaryDebounceTokens: Some(0),
+            ..settings
+        };
+        assert!(shouldGenerateIncrementalSummary(
+            1, 100_000, true, &disabled
+        ));
     }
 
     /// Explicit summary opt-out and ephemeral turns must continue without automatic compaction.

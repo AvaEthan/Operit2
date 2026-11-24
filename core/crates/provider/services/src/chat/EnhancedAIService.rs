@@ -72,6 +72,7 @@ const TAG: &str = "EnhancedAIService";
 struct ToolResultContinuation {
     results: Vec<ToolResult>,
     message: String,
+    blobHashes: Vec<Option<String>>,
 }
 
 /// Describes the next action without retaining a previous round's execution future.
@@ -79,6 +80,12 @@ enum ResponseRoundAction {
     Complete,
     ExecuteTools(Vec<ToolInvocation>),
     Continue(ToolResultContinuation),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequestWindowEstimate {
+    pub chatId: Option<String>,
+    pub windowSize: i64,
 }
 
 pub struct EnhancedAIService {
@@ -89,7 +96,7 @@ pub struct EnhancedAIService {
     pub file_binding_service: FileBindingServiceMirror,
     pub tool_handler: AIToolHandler,
     pub input_processing_state: MutableStateFlow<InputProcessingState>,
-    pub request_window_estimate_flow: MutableStateFlow<Option<i64>>,
+    pub request_window_estimate_flow: MutableStateFlow<Option<RequestWindowEstimate>>,
     pub api_preferences: ApiPreferencesMirror,
     pub tool_processing_scope: ToolProcessingScopeMirror,
     pub package_manager: PackageManagerMirror,
@@ -100,7 +107,7 @@ pub struct EnhancedAIService {
 #[derive(Clone, Debug, Default)]
 pub struct EnhancedAISharedState {
     pub turn_token_usage: TurnTokenUsage,
-    pub request_window_estimate: Option<i64>,
+    pub request_window_estimate: Option<RequestWindowEstimate>,
     pub active_execution_contexts: BTreeMap<i32, MessageExecutionContext>,
     pub next_execution_context_id: i32,
     /// Invalidates sends that are still waiting to register their response task.
@@ -635,6 +642,15 @@ pub struct RuntimePromptHistoryHooks {
     purpose: PromptPreparationPurpose,
 }
 
+/// Finalizes a send through its handlers in send-stage order.
+async fn finalize_send_prompt(mut context: PromptHookContext) -> Result<PromptHookContext, String> {
+    for stage in ["before_finalize_prompt", "before_send_to_model"] {
+        context.stage = stage.into();
+        context = PromptHookRegistry::dispatchPromptFinalizeHooks(context).await?;
+    }
+    Ok(context)
+}
+
 /// Finalizes an independent estimate through its own handlers in send-stage order.
 async fn finalize_estimate_prompt(mut context: PromptHookContext) -> Result<PromptHookContext, String> {
     for stage in ["before_finalize_prompt", "before_send_to_model"] {
@@ -895,10 +911,11 @@ impl EnhancedAIService {
         runtime.modelParameters.clone()
     }
 
-    pub fn publishRequestWindowEstimate(&mut self, windowSize: i64) {
-        self.shared_state().request_window_estimate = Some(windowSize);
+    pub fn publishRequestWindowEstimate(&mut self, chatId: Option<String>, windowSize: i64) {
+        let estimate = RequestWindowEstimate { chatId, windowSize };
+        self.shared_state().request_window_estimate = Some(estimate.clone());
         self.request_window_estimate_flow
-            .set_value(Some(windowSize));
+            .set_value(Some(estimate));
     }
 
     pub async fn estimatePreparedRequestWindow(
@@ -906,6 +923,7 @@ impl EnhancedAIService {
         serviceForFunction: SharedAIServiceHandle,
         preparedHistory: &[PromptTurn],
         availableTools: &[ToolPrompt],
+        chatId: Option<String>,
         publishEstimate: bool,
     ) -> Result<i64, AiServiceError> {
         let windowSize = {
@@ -915,7 +933,7 @@ impl EnhancedAIService {
                 .await?
         };
         if publishEstimate {
-            self.publishRequestWindowEstimate(windowSize);
+            self.publishRequestWindowEstimate(chatId, windowSize);
         }
         Ok(windowSize)
     }
@@ -1258,6 +1276,7 @@ impl EnhancedAIService {
         proxySenderName: Option<String>,
         chatProviderIdOverride: Option<String>,
         chatModelIdOverride: Option<String>,
+        promptPreparationPurpose: PromptPreparationPurpose,
         publishEstimate: bool,
         mut runtime: SendMessageRuntime,
     ) -> Result<i64, AiServiceError> {
@@ -1276,7 +1295,7 @@ impl EnhancedAIService {
                 FunctionType::CHAT,
                 chatProviderIdOverride.clone(),
                 chatModelIdOverride.clone(),
-                PromptPreparationPurpose::Estimate,
+                promptPreparationPurpose,
                 &runtime,
             )
             .await?;
@@ -1307,7 +1326,7 @@ impl EnhancedAIService {
         ));
         let context = PromptHookContext {
             stage: "before_finalize_prompt".into(),
-            chat_id: chatId,
+            chat_id: chatId.clone(),
             function_type: Some(function_type_name(&FunctionType::CHAT).into()),
             prompt_function_type: Some(prompt_function_type_name(&promptFunctionType).into()),
             raw_input: Some(message.clone()),
@@ -1318,10 +1337,14 @@ impl EnhancedAIService {
             metadata,
             ..PromptHookContext::default()
         };
-        let finalized = finalize_estimate_prompt(context)
-            .await.map_err(AiServiceError::RequestFailed)?;
-        let processedInput = finalized.processed_input
-            .ok_or_else(|| AiServiceError::RequestFailed("Estimate hooks removed processed input".into()))?;
+        let finalized = match promptPreparationPurpose {
+            PromptPreparationPurpose::Send => finalize_send_prompt(context).await,
+            PromptPreparationPurpose::Estimate => finalize_estimate_prompt(context).await,
+        }
+        .map_err(AiServiceError::RequestFailed)?;
+        let processedInput = finalized.processed_input.ok_or_else(|| {
+            AiServiceError::RequestFailed("Prompt finalize hooks removed processed input".into())
+        })?;
         let preparedHistory = self.applyFinalizedCurrentUserTurn(
             finalized.prepared_history, &message, &processedInput,
         );
@@ -1329,6 +1352,7 @@ impl EnhancedAIService {
             serviceForFunction,
             &preparedHistory,
             &availableTools,
+            chatId,
             publishEstimate,
         )
         .await
@@ -1411,7 +1435,7 @@ impl EnhancedAIService {
     }
 
     #[allow(non_snake_case)]
-    pub fn requestWindowEstimateFlow(&self) -> MutableStateFlow<Option<i64>> {
+    pub fn requestWindowEstimateFlow(&self) -> MutableStateFlow<Option<RequestWindowEstimate>> {
         self.request_window_estimate_flow.clone()
     }
 
@@ -1948,6 +1972,7 @@ impl EnhancedAIService {
                 serviceForFunction.clone(),
                 &requestHistory,
                 &availableTools,
+                chatId.clone(),
                 true,
             )
             .await?;
@@ -2265,6 +2290,7 @@ impl EnhancedAIService {
             runtime.aiService.clone(),
             &execContext.conversationHistory,
             &preparedRequest.availableTools,
+            chatId.clone(),
             false,
         ).await {
             Ok(windowSize) => Some(windowSize),
@@ -2280,7 +2306,7 @@ impl EnhancedAIService {
             return Ok(());
         }
         if let Some(windowSize) = completedContextWindow {
-            self.publishRequestWindowEstimate(windowSize);
+            self.publishRequestWindowEstimate(chatId.clone(), windowSize);
         }
         AppLogger::v_with_level(TAG, &format!(
             "completed request window from prepared state chatId={} executionId={} elapsedMs={} success={}",
@@ -2334,6 +2360,7 @@ impl EnhancedAIService {
         &mut self,
         collector: &SharedAiResponseStream,
         results: Vec<operit_tools::ConversationMarkupManager::ToolResult>,
+        blobHashes: Vec<Option<String>>,
         context: &mut MessageExecutionContext,
         functionType: FunctionType,
         promptFunctionType: PromptFunctionType,
@@ -2360,6 +2387,11 @@ impl EnhancedAIService {
             .map(|result| result.toolName.clone())
             .collect::<Vec<_>>()
             .join(", ");
+        let toolResultMessage = operit_tools::ConversationMarkupManager::ConversationMarkupManager::projectToolResultMessageForSend(
+            &toolResultMessage,
+            &blobHashes,
+            runtime.chatConfiguration.toolResultInlineLimitChars(),
+        ).map_err(AiServiceError::RequestFailed)?;
         let toolResultMessageLen = toolResultMessage.len();
         if toolResultMessage.trim().is_empty() {
             return Err(AiServiceError::RequestFailed(
@@ -2472,6 +2504,7 @@ impl EnhancedAIService {
                 runtime.aiService.clone(),
                 &currentChatHistory,
                 &availableTools,
+                chatId.clone(),
                 true,
             )
             .await?;
@@ -2764,31 +2797,33 @@ impl EnhancedAIService {
             };
 
             // Finish this request before inspecting and dispatching the next response round.
-            let shouldContinue = self.processToolResults(
-                collector,
-                continuation.results,
-                context,
-                functionType.clone(),
-                promptFunctionType.clone(),
-                enableThinking,
-                onNonFatalError,
-                onTokenLimitExceeded,
-                maxTokens,
-                tokenUsageThreshold,
-                isSubTask,
-                participantName.clone(),
-                avatarUri.clone(),
-                participantId.clone(),
-                chatId.clone(),
-                onToolInvocation.clone(),
-                chatProviderIdOverride.clone(),
-                chatModelIdOverride.clone(),
-                stream,
-                continuation.message,
-                callbacks.clone(),
-                runtime,
-            )
-            .await?;
+            let shouldContinue = self
+                .processToolResults(
+                    collector,
+                    continuation.results,
+                    continuation.blobHashes,
+                    context,
+                    functionType.clone(),
+                    promptFunctionType.clone(),
+                    enableThinking,
+                    onNonFatalError,
+                    onTokenLimitExceeded,
+                    maxTokens,
+                    tokenUsageThreshold,
+                    isSubTask,
+                    participantName.clone(),
+                    avatarUri.clone(),
+                    participantId.clone(),
+                    chatId.clone(),
+                    onToolInvocation.clone(),
+                    chatProviderIdOverride.clone(),
+                    chatModelIdOverride.clone(),
+                    stream,
+                    continuation.message,
+                    callbacks.clone(),
+                    runtime,
+                )
+                .await?;
             if !shouldContinue {
                 return Ok(());
             }
@@ -2836,6 +2871,7 @@ impl EnhancedAIService {
                 return ResponseRoundAction::Continue(ToolResultContinuation {
                     results: Vec::new(),
                     message: emptyResponseWarning,
+                    blobHashes: Vec::new(),
                 });
             }
             AppLogger::v_with_level(
@@ -2891,6 +2927,7 @@ impl EnhancedAIService {
             return ResponseRoundAction::Continue(ToolResultContinuation {
                 results: Vec::new(),
                 message: pureThinkingWarning,
+                blobHashes: Vec::new(),
             });
         }
 
@@ -3076,6 +3113,7 @@ impl EnhancedAIService {
             results: allToolResults,
             message: toolResultMessage,
             displayMessage,
+            blobHashes,
             routeChangeIntent,
         } = toolBatch.map_err(AiServiceError::RequestFailed)?;
         let routeChangeTargetNodeId = routeChangeIntent
@@ -3120,6 +3158,7 @@ impl EnhancedAIService {
         Ok(Some(ToolResultContinuation {
             results: allToolResults,
             message: toolResultMessage,
+            blobHashes,
         }))
     }
 
@@ -3239,7 +3278,15 @@ impl EnhancedAIService {
 
     #[allow(non_snake_case)]
     pub fn getRequestWindowEstimate(&self) -> Option<i64> {
-        self.shared_state().request_window_estimate
+        self.shared_state()
+            .request_window_estimate
+            .as_ref()
+            .map(|estimate| estimate.windowSize)
+    }
+
+    #[allow(non_snake_case)]
+    pub fn getRequestWindowEstimateEvent(&self) -> Option<RequestWindowEstimate> {
+        self.shared_state().request_window_estimate.clone()
     }
 
     #[allow(non_snake_case)]
@@ -3874,7 +3921,26 @@ mod estimate_hook_tests {
         ]);
         let mut failing = context;
         failing.metadata.insert("fail".into(), json!(true));
-        assert_eq!(finalize_estimate_prompt(failing).await.err().as_deref(), Some("estimate hook failed"));
+        assert_eq!(
+            finalize_estimate_prompt(failing).await.err().as_deref(),
+            Some("estimate hook failed")
+        );
+        events.lock().unwrap().clear();
+        let finalized = finalize_send_prompt(PromptHookContext {
+            chat_id: Some("estimate-routing-test".into()),
+            processed_input: Some("question".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(finalized.prepared_history.len(), 2);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "send-finalize:before_finalize_prompt",
+                "send-finalize:before_send_to_model",
+            ]
+        );
         PromptHookRegistry::unregisterPromptHistoryHook("estimate-routing-test-send-history");
         PromptHookRegistry::unregisterPromptEstimateHistoryHook("estimate-routing-test-estimate-history");
         PromptHookRegistry::unregisterPromptFinalizeHook("estimate-routing-test-send-finalize");

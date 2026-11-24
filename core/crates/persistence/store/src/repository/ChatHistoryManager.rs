@@ -36,6 +36,23 @@ use serde::{Deserialize, Serialize};
 
 const LOCATOR_PREVIEW_CHAR_COUNT: i32 = 48;
 
+fn messageBlobOwners(message: &ChatMessage) -> (Vec<String>, Vec<String>) {
+    let owners = message
+        .pluginExtensions
+        .iter()
+        .filter_map(|(owner, identity)| {
+            identity
+                .get("participantId")
+                .and_then(serde_json::Value::as_str)
+                .map(|participant| (participant.to_string(), owner.clone()))
+        })
+        .collect::<HashSet<_>>();
+    (
+        owners.iter().map(|(participant, _)| participant.clone()).collect(),
+        owners.iter().map(|(_, owner)| owner.clone()).collect(),
+    )
+}
+
 /// Builds persistence rows for every part in one message revision.
 fn messagePartEntities(
     chatId: &str,
@@ -859,9 +876,12 @@ impl ChatHistoryManager {
                 let entity = MessageEntity::fromChatMessage(chatId.to_string(), messageToPersist.clone(), orderIndex, 0);
                 transaction.execute(insertMessageSql(false), insertMessageParams(&entity, false)?)?;
             }
+            let (participantIds, extensionOwners) = messageBlobOwners(&messageToPersist);
             MessagePartDao::replacePartsInTransaction(
                 transaction, chatId, timestamp, variantIndex,
                 messagePartEntities(chatId, timestamp, variantIndex, &messageToPersist.parts),
+                &participantIds,
+                &extensionOwners,
             )?;
             if existing.is_none() && messageToPersist.sender == "user" {
                 transaction.execute(
@@ -874,6 +894,52 @@ impl ChatHistoryManager {
             Ok(())
         })?;
         Ok(messageToPersist)
+    }
+
+    pub fn storeToolResultBlob(
+        &self,
+        chatId: String,
+        content: String,
+    ) -> ChatHistoryManagerResult<String> {
+        Ok(self
+            .database
+            .messagePartDao()
+            .storeToolResultBlob(&chatId, &content)?)
+    }
+
+    pub fn stageToolResultBlob(
+        &self,
+        chatId: String,
+        participantId: Option<String>,
+        extensionOwner: String,
+        content: String,
+    ) -> ChatHistoryManagerResult<String> {
+        Ok(self
+            .database
+            .messagePartDao()
+            .stageToolResultBlob(&chatId, participantId.as_deref(), &extensionOwner, &content)?)
+    }
+
+    pub fn readToolResultBlob(
+        &self,
+        chatId: String,
+        participantId: Option<String>,
+        extensionOwner: String,
+        hash: String,
+        offset: usize,
+        limit: usize,
+    ) -> ChatHistoryManagerResult<String> {
+        Ok(self
+            .database
+            .messagePartDao()
+            .readToolResultBlob(
+                &chatId,
+                participantId.as_deref(),
+                &extensionOwner,
+                &hash,
+                offset,
+                limit,
+            )?)
     }
 
     /// Resolves an anchored message timestamp against the current stored neighbors.
@@ -1193,9 +1259,10 @@ impl ChatHistoryManager {
             )?.expect("aggregate variant count must return one row");
             let nextVariantIndex: i32 = row.get(0)?;
             let parts = messagePartEntities(&chatId, messageTimestamp, nextVariantIndex, &message.parts);
+            let participantIds = messageBlobOwners(&message);
             let variant = MessageVariantEntity::fromChatMessage(chatId.clone(), messageTimestamp, nextVariantIndex, message, 0);
             transaction.execute(insertVariantSql(false), insertVariantParams(&variant, false)?)?;
-            MessagePartDao::replacePartsInTransaction(transaction, &chatId, messageTimestamp, nextVariantIndex, parts)?;
+            MessagePartDao::replacePartsInTransaction(transaction, &chatId, messageTimestamp, nextVariantIndex, parts, &participantIds.0, &participantIds.1)?;
             transaction.execute(
                 "UPDATE messages SET selectedVariantIndex = ?3 WHERE chatId = ?1 AND timestamp = ?2",
                 sqliteParams![chatId, messageTimestamp, nextVariantIndex],
@@ -1293,6 +1360,34 @@ impl ChatHistoryManager {
         self.loadChatHistory(chatId.clone())?.ok_or_else(|| {
             ChatHistoryManagerError::IllegalArgument(format!("Chat does not exist: {chatId}"))
         })
+    }
+
+    /// Persists a stable estimate only if no reply committed after estimation began.
+    pub fn updateChatContextWindowIfCurrent(
+        &self,
+        chatId: String,
+        currentWindowSize: i64,
+        expectedInputTokens: i64,
+        expectedOutputTokens: i64,
+        expectedWindowSize: i64,
+        expectedUpdatedAt: String,
+    ) -> ChatHistoryManagerResult<Option<ChatHistory>> {
+        let expectedUpdatedAt = expectedUpdatedAt.parse::<i64>().map_err(|_| {
+            ChatHistoryManagerError::IllegalArgument("Chat updatedAt must be an integer".into())
+        })?;
+        if !self.chatDao.updateChatContextWindowIfCurrent(
+            &chatId,
+            currentWindowSize,
+            expectedInputTokens,
+            expectedOutputTokens,
+            expectedWindowSize,
+            expectedUpdatedAt,
+            currentTimeMillis(),
+        )? {
+            return Ok(None);
+        }
+        self.recordChatMetadata(&chatId)?;
+        Ok(self.loadChatHistory(chatId)?)
     }
 
     /// Persists the active chat id.
@@ -1689,6 +1784,14 @@ impl ChatHistoryManager {
     /// Checks for a newer committed user turn without loading conversation messages.
     pub fn hasUserMessageAfter(&self, chatId: &str, timestamp: i64) -> ChatHistoryManagerResult<bool> {
         Ok(self.messageDao.existsUserMessageAfterTimestamp(chatId, timestamp)?)
+    }
+
+    /// Loads the latest assistant request usage for context cache-hit display.
+    pub fn loadLatestAssistantTokenUsage(
+        &self,
+        chatId: &str,
+    ) -> ChatHistoryManagerResult<Option<(i64, i64)>> {
+        Ok(self.messageDao.getLatestAssistantTokenUsage(chatId)?)
     }
 
     /// Loads runtime-visible messages for model context.

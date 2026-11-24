@@ -1149,15 +1149,21 @@ mod summary_tests {
 
     #[test]
     fn summary_prompt_inherits_previous_summary_in_both_languages() {
+        use crate::chat::config::FunctionalPrompts::{SUMMARY_PROTOCOL_CN, SUMMARY_PROTOCOL_EN};
+
         for use_english in [false, true] {
             let previous = "Important context from the previous conversation.";
             let prompt = FunctionalPrompts::buildSummarySystemPrompt(Some(previous), use_english);
             assert!(prompt.starts_with(FunctionalPrompts::summaryPrompt(use_english)));
             assert_eq!(prompt.matches(previous).count(), 1);
-            assert_eq!(
-                FunctionalPrompts::buildSummarySystemPrompt(Some(" \n"), use_english),
-                FunctionalPrompts::summaryPrompt(use_english)
-            );
+            let withoutPrevious =
+                FunctionalPrompts::buildSummarySystemPrompt(Some(" \n"), use_english);
+            assert!(withoutPrevious.starts_with(FunctionalPrompts::summaryPrompt(use_english)));
+            assert!(withoutPrevious.contains(if use_english {
+                SUMMARY_PROTOCOL_EN
+            } else {
+                SUMMARY_PROTOCOL_CN
+            }));
         }
     }
 

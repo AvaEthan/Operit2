@@ -63,6 +63,170 @@ fn summary_context_window_update_preserves_completed_reply_totals() {
         .is_err());
 }
 
+/// Rejects a stale stable estimate after a newer reply commits its accounting.
+#[test]
+fn context_window_compare_and_set_preserves_the_newer_reply() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let (manager, _) = chatOrderFixture("summary-context-window-cas");
+    manager
+        .updateChatTokenCounts("older".to_string(), 100, 20, 120)
+        .unwrap();
+
+    manager
+        .updateChatTokenCounts("older".to_string(), 160, 50, 210)
+        .unwrap();
+    let newer = manager
+        .loadChatHistory("older".to_string())
+        .unwrap()
+        .unwrap();
+    assert!(
+        manager
+            .updateChatContextWindowIfCurrent(
+                "older".to_string(),
+                40,
+                100,
+                20,
+                120,
+                newer.updatedAt.clone()
+            )
+            .unwrap()
+            .is_none()
+    );
+    let persisted = manager
+        .loadChatHistory("older".to_string())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            persisted.inputTokens,
+            persisted.outputTokens,
+            persisted.currentWindowSize
+        ),
+        (160, 50, 210)
+    );
+
+    assert!(
+        manager
+            .updateChatContextWindowIfCurrent(
+                "older".to_string(),
+                40,
+                160,
+                50,
+                210,
+                (newer.updatedAt.parse::<i64>().unwrap() - 1).to_string(),
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        manager
+            .updateChatContextWindowIfCurrent(
+                "older".to_string(),
+                40,
+                160,
+                50,
+                210,
+                newer.updatedAt.clone()
+            )
+            .unwrap()
+            .is_some()
+    );
+    let persisted = manager
+        .loadChatHistory("older".to_string())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            persisted.inputTokens,
+            persisted.outputTokens,
+            persisted.currentWindowSize
+        ),
+        (160, 50, 40)
+    );
+}
+
+/// Preserves summary accounting metadata across the append-only checkpoint round trip.
+#[test]
+fn summary_checkpoint_round_trip_preserves_plugin_extensions() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let (manager, _) = chatOrderFixture("summary-accounting-round-trip");
+    for (timestamp, sender, content) in [
+        (100, "user", "first"),
+        (200, "ai", "summarized"),
+        (300, "user", "retained"),
+        (400, "ai", "reply"),
+    ] {
+        manager
+            .addMessage(
+                "older".into(),
+                ChatMessage::new_with_markdown_timestamp(
+                    sender.into(),
+                    content.into(),
+                    timestamp,
+                ),
+            )
+            .unwrap();
+    }
+    let mut summary =
+        ChatMessage::new_with_markdown_timestamp("summary".into(), "checkpoint".into(), 250);
+    summary.pluginExtensions.insert(
+        "operit.host.context-summary".into(),
+        serde_json::json!({"baselineTimestamp": 400}),
+    );
+    manager
+        .addSummaryMessageBetweenSliceNeighbors(
+            "older".into(),
+            summary,
+            Some(200),
+            Some(300),
+        )
+        .unwrap()
+        .unwrap();
+
+    let messages = manager
+        .loadChatMessagesRange("older".into(), "asc".into(), 0, 79)
+        .unwrap();
+    assert_eq!(
+        messages
+            .iter()
+            .map(|message| message.timestamp)
+            .collect::<Vec<_>>(),
+        vec![100, 200, 250, 300, 400]
+    );
+    assert_eq!(
+        messages[2]
+            .pluginExtensions
+            .get("operit.host.context-summary")
+            .and_then(|value| value.get("baselineTimestamp"))
+            .and_then(serde_json::Value::as_i64),
+        Some(400)
+    );
+}
+
+/// Reads cache usage from the latest assistant message, not later user or summary rows.
+#[test]
+fn latest_assistant_usage_ignores_non_assistant_messages() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let (manager, _) = chatOrderFixture("latest-assistant-cache-usage");
+    for (sender, timestamp, input, cached) in [
+        ("ai", 10, 100, 40),
+        ("ai", 20, 200, 120),
+        ("user", 30, 999, 999),
+        ("summary", 40, 999, 999),
+    ] {
+        let mut message =
+            ChatMessage::new_with_markdown_timestamp(sender.into(), "body".into(), timestamp);
+        message.inputTokens = input;
+        message.cachedInputTokens = cached;
+        manager.addMessage("older".into(), message).unwrap();
+    }
+
+    assert_eq!(
+        manager.loadLatestAssistantTokenUsage("older").unwrap(),
+        Some((200, 120))
+    );
+}
+
 /// Opens a chat whose binding arrives before its workspace preference record.
 fn workspaceMetadataFixture(name: &str) -> (ChatHistoryManager, Arc<AppDatabase>, Workspace) {
     crate::PreferencesDataStore::installPreferenceObserverTestHost();
@@ -497,6 +661,509 @@ fn failed_reindex_rolls_back_the_entire_revision_deletion() {
         assert!(deleteRevision(&database, index).is_err());
         assert_eq!(snapshot(&database), before);
     }
+}
+
+/// Tool-result blobs preserve full Unicode content, variants, and reference authorization.
+#[test]
+fn tool_result_blobs_are_atomic_reference_aware_and_collectable() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let (manager, database) = chatOrderFixture("tool-result-blob-lifecycle");
+    let content = "完整结果🦀\n".repeat(5000);
+    let pendingHash = manager
+        .storeToolResultBlob("older".into(), content.clone())
+        .unwrap();
+    assert_eq!(
+        manager
+            .readToolResultBlob("older".into(), None, String::new(), pendingHash.clone(), 0, 1_000_000)
+            .unwrap(),
+        content
+    );
+    assert_eq!(
+        manager
+            .readToolResultBlob("older".into(), None, String::new(), pendingHash.clone(), 1, 3)
+            .unwrap(),
+        "整结果"
+    );
+    assert!(manager
+        .readToolResultBlob(
+            "older".into(),
+            Some("participant-b".into()),
+            String::new(),
+            pendingHash.clone(),
+            0,
+            100
+        )
+        .is_err());
+    database
+        .messagePartDao()
+        .collectUnreferencedToolResultBlobs()
+        .unwrap();
+    assert_eq!(
+        manager
+            .readToolResultBlob("older".into(), None, String::new(), pendingHash.clone(), 0, 1_000_000)
+            .unwrap(),
+        content
+    );
+    let mut original = ChatMessage::new_with_markdown_timestamp("ai".into(), String::new(), 100);
+    original.parts = vec![operit_model::MessagePart::MessagePart::toolResult(
+        "part-0".into(),
+        0,
+        Some("call-1".into()),
+        "read_file".into(),
+        "success".into(),
+        content.clone(),
+    )];
+    original.pluginExtensions.insert(
+        "fixture.owner".into(),
+        serde_json::json!({"participantId":"participant-a"}),
+    );
+    manager
+        .addMessage("older".into(), original.clone())
+        .unwrap();
+    let stored = database
+        .messagePartDao()
+        .getPartsForMessage("older", 100, 0)
+        .unwrap();
+    assert_eq!(stored[0].content, content);
+    let hash = stored[0].attributes.get("blob_hash").unwrap().clone();
+    assert_eq!(hash, pendingHash);
+    assert_eq!(hash.len(), 64);
+    let pendingCount: i64 = database
+        .store()
+        .queryScalar("SELECT COUNT(*) FROM pending_tool_result_blobs", sqliteParams![])
+        .unwrap();
+    assert_eq!(pendingCount, 0);
+    assert_eq!(
+        manager
+            .readToolResultBlob(
+                "older".into(),
+                Some("participant-a".into()),
+                "fixture.owner".into(),
+                hash.clone(),
+                0,
+                1_000_000,
+            )
+            .unwrap(),
+        content
+    );
+    assert!(manager
+        .readToolResultBlob(
+            "older".into(),
+            Some("participant-b".into()),
+            "fixture.owner".into(),
+            hash.clone(),
+            0,
+            100,
+        )
+        .is_err());
+    database
+        .store()
+        .execute(
+            "DELETE FROM tool_result_blobs WHERE hash = ?1",
+            sqliteParams![hash],
+        )
+        .unwrap();
+    assert_eq!(
+        manager
+            .readToolResultBlob("older".into(), None, String::new(), hash.clone(), 0, 1_000_000)
+            .unwrap(),
+        content
+    );
+    manager
+        .storeToolResultBlob("older".into(), content.clone())
+        .unwrap();
+    assert!(
+        manager
+            .readToolResultBlob("recent".into(), None, String::new(), hash.clone(), 0, 100)
+            .is_err()
+    );
+    assert_eq!(
+        manager
+            .readToolResultBlob("older".into(), None, String::new(), hash.clone(), 0, 1_000_000)
+            .unwrap(),
+        content
+    );
+    assert_eq!(
+        manager
+            .readToolResultBlob("older".into(), None, String::new(), hash.clone(), 1, 3)
+            .unwrap(),
+        "整结果"
+    );
+    assert!(
+        manager
+            .readToolResultBlob("recent".into(), None, String::new(), hash.clone(), 0, 100)
+            .is_err()
+    );
+
+    let mut variant = original.clone();
+    variant.parts[0].content = format!("{content}variant");
+    manager
+        .addMessageVariant("older".into(), 100, variant)
+        .unwrap();
+    database
+        .messagePartDao()
+        .copyPartsToChat("older", "pinned", None)
+        .unwrap();
+    assert_eq!(
+        manager
+            .readToolResultBlob("pinned".into(), None, String::new(), hash.clone(), 0, 1_000_000)
+            .unwrap(),
+        content
+    );
+    manager.deleteMessage("older".into(), 100).unwrap();
+    assert_eq!(
+        manager
+            .readToolResultBlob("pinned".into(), None, String::new(), hash.clone(), 0, 1_000_000)
+            .unwrap(),
+        content
+    );
+    manager.deleteMessagesFrom("pinned".into(), 100).unwrap();
+    assert!(
+        manager
+            .readToolResultBlob("pinned".into(), None, String::new(), hash, 0, 100)
+            .is_err()
+    );
+    let count: i64 = database
+        .store()
+        .queryScalar("SELECT COUNT(*) FROM tool_result_blobs", sqliteParams![])
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn committing_one_participant_does_not_finalize_another_pending_blob() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let (manager, database) = chatOrderFixture("pending-blob-participants");
+    let content = "shared full result".repeat(1000);
+    let hash = manager
+        .stageToolResultBlob(
+            "older".into(),
+            Some("participant-a".into()),
+            "fixture.owner".into(),
+            content.clone(),
+        )
+        .unwrap();
+    assert_eq!(
+        manager
+            .stageToolResultBlob(
+                "older".into(),
+                Some("participant-b".into()),
+                "fixture.owner".into(),
+                content.clone(),
+            )
+            .unwrap(),
+        hash
+    );
+    assert!(manager
+        .readToolResultBlob(
+            "older".into(),
+            Some("participant-a".into()),
+            "other.owner".into(),
+            hash.clone(),
+            0,
+            100,
+        )
+        .is_err());
+    let mut message = ChatMessage::new_with_markdown_timestamp("ai".into(), String::new(), 100);
+    message.parts = vec![operit_model::MessagePart::MessagePart::toolResult(
+        "part-0".into(),
+        0,
+        Some("call-a".into()),
+        "read_file".into(),
+        "success".into(),
+        content.clone(),
+    )];
+    message.pluginExtensions.insert(
+        "fixture.owner".into(),
+        serde_json::json!({"participantId":"participant-a"}),
+    );
+    manager.addMessage("older".into(), message.clone()).unwrap();
+    let pendingCount: i64 = database
+        .store()
+        .queryScalar("SELECT COUNT(*) FROM pending_tool_result_blobs", sqliteParams![])
+        .unwrap();
+    assert_eq!(pendingCount, 1);
+    assert_eq!(
+        manager
+            .readToolResultBlob(
+                "older".into(),
+                Some("participant-b".into()),
+                "fixture.owner".into(),
+                hash.clone(),
+                0,
+                1_000_000,
+            )
+            .unwrap(),
+        content
+    );
+
+    message.parts[0].toolCallId = Some("call-b".into());
+    message.pluginExtensions.insert(
+        "fixture.owner".into(),
+        serde_json::json!({"participantId":"participant-b"}),
+    );
+    manager.addMessageVariant("older".into(), 100, message).unwrap();
+    let pendingCount: i64 = database
+        .store()
+        .queryScalar("SELECT COUNT(*) FROM pending_tool_result_blobs", sqliteParams![])
+        .unwrap();
+    assert_eq!(pendingCount, 0);
+
+    let lateHash = manager
+        .stageToolResultBlob(
+            "older".into(),
+            Some("participant-c".into()),
+            "fixture.owner".into(),
+            content.clone(),
+        )
+        .unwrap();
+    assert_eq!(lateHash, hash);
+    assert_eq!(
+        manager
+            .readToolResultBlob(
+                "older".into(),
+                Some("participant-c".into()),
+                "fixture.owner".into(),
+                hash,
+                0,
+                1_000_000,
+            )
+            .unwrap(),
+        content
+    );
+}
+
+#[test]
+fn latest_assistant_usage_follows_the_selected_variant() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let (manager, _) = chatOrderFixture("selected-variant-usage");
+    let mut message = ChatMessage::new_with_markdown_timestamp("ai".into(), "base".into(), 100);
+    message.inputTokens = 150;
+    message.cachedInputTokens = 50;
+    manager.addMessage("older".into(), message.clone()).unwrap();
+    assert_eq!(
+        manager.loadLatestAssistantTokenUsage("older").unwrap(),
+        Some((150, 50))
+    );
+
+    message.inputTokens = 900;
+    message.cachedInputTokens = 450;
+    let variantIndex = manager
+        .addMessageVariant("older".into(), 100, message)
+        .unwrap();
+    assert_eq!(
+        manager.loadLatestAssistantTokenUsage("older").unwrap(),
+        Some((900, 450))
+    );
+    manager
+        .selectMessageVariant("older".into(), 100, 0)
+        .unwrap();
+    assert_eq!(
+        manager.loadLatestAssistantTokenUsage("older").unwrap(),
+        Some((150, 50))
+    );
+    manager
+        .selectMessageVariant("older".into(), 100, variantIndex)
+        .unwrap();
+    assert_eq!(
+        manager.loadLatestAssistantTokenUsage("older").unwrap(),
+        Some((900, 450))
+    );
+}
+
+#[test]
+fn abandoned_pending_blobs_expire_and_chat_deletion_cleans_them() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let (manager, database) = chatOrderFixture("pending-blob-cleanup");
+    let expiredHash = manager
+        .stageToolResultBlob(
+            "older".into(),
+            Some("participant-a".into()),
+            "fixture.owner".into(),
+            "abandoned result".into(),
+        )
+        .unwrap();
+    database
+        .store()
+        .execute(
+            "UPDATE pending_tool_result_blobs SET created_at = 0 WHERE hash = ?1",
+            sqliteParams![expiredHash],
+        )
+        .unwrap();
+    assert!(manager
+        .readToolResultBlob(
+            "older".into(),
+            Some("participant-a".into()),
+            "fixture.owner".into(),
+            expiredHash,
+            0,
+            100,
+        )
+        .is_err());
+    database
+        .messagePartDao()
+        .collectUnreferencedToolResultBlobs()
+        .unwrap();
+    assert_eq!(
+        database
+            .store()
+            .queryScalar::<i64>("SELECT COUNT(*) FROM pending_tool_result_blobs", sqliteParams![])
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        database
+            .store()
+            .queryScalar::<i64>("SELECT COUNT(*) FROM tool_result_blobs", sqliteParams![])
+            .unwrap(),
+        0
+    );
+
+    let deletedHash = manager
+        .stageToolResultBlob(
+            "recent".into(),
+            Some("participant-a".into()),
+            "fixture.owner".into(),
+            "result for deleted chat".into(),
+        )
+        .unwrap();
+    assert!(manager.deleteChatHistory("recent".into()).unwrap());
+    assert!(manager
+        .readToolResultBlob(
+            "recent".into(),
+            Some("participant-a".into()),
+            "fixture.owner".into(),
+            deletedHash,
+            0,
+            100,
+        )
+        .is_err());
+    assert_eq!(
+        database
+            .store()
+            .queryScalar::<i64>("SELECT COUNT(*) FROM pending_tool_result_blobs", sqliteParams![])
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        database
+            .store()
+            .queryScalar::<i64>("SELECT COUNT(*) FROM tool_result_blobs", sqliteParams![])
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn legacy_tool_results_gain_blob_pointers_without_changing_full_content() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let (manager, database) = chatOrderFixture("legacy-tool-result-backfill");
+    let content = "synced full result\n".repeat(2000);
+    let mut message = ChatMessage::new_with_markdown_timestamp("ai".into(), String::new(), 100);
+    message.parts = vec![operit_model::MessagePart::MessagePart::toolResult(
+        "part-0".into(),
+        0,
+        Some("call-1".into()),
+        "read_file".into(),
+        "success".into(),
+        content.clone(),
+    )];
+    manager.addMessage("older".into(), message).unwrap();
+    database
+        .store()
+        .executeBatch(
+            "UPDATE message_parts SET attributesJson = '{}'; DELETE FROM tool_result_blobs;",
+        )
+        .unwrap();
+
+    let loaded = manager
+        .loadChatMessagesRange("older".into(), "asc".into(), 0, 0)
+        .unwrap();
+    assert_eq!(loaded[0].parts[0].content, content);
+    let part = database
+        .messagePartDao()
+        .getPartsForMessage("older", 100, 0)
+        .unwrap()
+        .remove(0);
+    let hash = part.attributes.get("blob_hash").unwrap().clone();
+    assert_eq!(hash, crate::dao::MessagePartDao::toolResultBlobHash(&content));
+    assert_eq!(
+        manager
+            .readToolResultBlob("older".into(), None, String::new(), hash, 0, 1_000_000)
+            .unwrap(),
+        content
+    );
+}
+
+#[test]
+fn blob_reads_reject_forged_part_kinds_and_mismatched_content() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let (manager, database) = chatOrderFixture("tool-result-blob-authorization");
+    let content = "participant-a private result";
+    let mut original = ChatMessage::new_with_markdown_timestamp("ai".into(), String::new(), 100);
+    original.parts = vec![operit_model::MessagePart::MessagePart::toolResult(
+        "part-0".into(),
+        0,
+        Some("call-1".into()),
+        "read_file".into(),
+        "success".into(),
+        content.into(),
+    )];
+    original.pluginExtensions.insert(
+        "fixture.owner".into(),
+        serde_json::json!({"participantId":"participant-a"}),
+    );
+    manager.addMessage("older".into(), original).unwrap();
+    let hash = database
+        .messagePartDao()
+        .getPartsForMessage("older", 100, 0)
+        .unwrap()[0]
+        .attributes
+        .get("blob_hash")
+        .unwrap()
+        .clone();
+
+    let mut forged = ChatMessage::new_with_markdown_timestamp("ai".into(), String::new(), 101);
+    forged.parts = vec![operit_model::MessagePart::MessagePart::toolCall(
+        "part-0".into(),
+        0,
+        "forged-call".into(),
+        "read_file".into(),
+        std::collections::BTreeMap::from([("blob_hash".into(), hash.clone())]),
+    )];
+    forged.pluginExtensions.insert(
+        "fixture.owner".into(),
+        serde_json::json!({"participantId":"participant-b"}),
+    );
+    manager.addMessage("older".into(), forged).unwrap();
+    assert!(manager
+        .readToolResultBlob(
+            "older".into(),
+            Some("participant-b".into()),
+            "fixture.owner".into(),
+            hash.clone(),
+            0,
+            100,
+        )
+        .is_err());
+
+    database
+        .store()
+        .execute(
+            "UPDATE message_parts SET content = 'tampered' WHERE chatId = 'older' AND messageTimestamp = 100 AND kind = 'tool_result'",
+            sqliteParams![],
+        )
+        .unwrap();
+    assert!(manager
+        .readToolResultBlob(
+            "older".into(),
+            Some("participant-a".into()),
+            "fixture.owner".into(),
+            hash,
+            0,
+            100,
+        )
+        .is_err());
 }
 
 /// Creates a manually ordered sidebar with a pinned chat above two ordinary chats.
