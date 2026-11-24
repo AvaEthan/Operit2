@@ -87,6 +87,41 @@ class AndroidV8BuildTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "OPERIT_ANDROID_V8_API_LEVEL"):
                 v8.api_level()
 
+    def test_prefixed_ndk_directory_reuses_the_same_v8_cache(self):
+        prefixed = v8.configuration(
+            "152.2.0", "aarch64-linux-android", Path("android-ndk-28.2.13676358")
+        )
+        numeric = v8.configuration(
+            "152.2.0", "aarch64-linux-android", Path("28.2.13676358")
+        )
+        (self.gn_out / "args.gn").write_text("\n".join(
+            f"{key} = {json.dumps(value)}" for key, value in prefixed["gn"].items()))
+        v8.store_artifacts(self.gn_out, self.directory, prefixed)
+        self.assertTrue(v8.cache_valid(self.directory, numeric))
+        older = v8.configuration(
+            "152.2.0", "aarch64-linux-android", Path("27.0.12077973")
+        )
+        self.assertFalse(v8.cache_valid(self.directory, older))
+
+    def test_command_output_is_decoded_as_utf8(self):
+        completed = subprocess.CompletedProcess(["cargo", "metadata"], 0, stdout="café\n", stderr="")
+        with patch.object(v8.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(v8.output(["cargo", "metadata"]), "café")
+        self.assertEqual(run.call_args.kwargs["encoding"], "utf-8")
+        self.assertEqual(run.call_args.kwargs["errors"], "replace")
+
+    def test_linux_can_use_the_clang_downloaded_by_v8(self):
+        downloaded = self.root / "clang/lib"
+        with patch.object(v8, "IS_WINDOWS", False), \
+             patch.object(v8.sys, "platform", "linux"), \
+             patch.object(v8.Path, "glob", return_value=[]):
+            self.assertEqual(v8.find_libclang(downloaded), downloaded)
+
+    def test_windows_rejects_unsupported_v8_source_builds_early(self):
+        with patch.object(v8, "IS_WINDOWS", True):
+            with self.assertRaisesRegex(RuntimeError, "require Linux"):
+                v8.build(self.cache, self.config, None)
+
     def test_build_failure_emits_no_environment_and_never_falls_back_to_download(self):
         env_file = self.root / "v8.env"
         with patch.object(v8, "version_from_lock", return_value="152.2.0"), \
