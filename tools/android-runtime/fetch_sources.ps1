@@ -10,7 +10,10 @@ New-Item -ItemType Directory -Force -Path $sourcesDir | Out-Null
 $items = @(
     @{
         Name = "busybox-1.38.0"
-        Urls = @("https://busybox.net/downloads/busybox-1.38.0.tar.bz2")
+        Urls = @(
+            "https://busybox.net/downloads/busybox-1.38.0.tar.bz2"
+            "https://sources.buildroot.net/busybox/busybox-1.38.0.tar.bz2"
+        )
         Archive = "busybox-1.38.0.tar.bz2"
         Sha256 = "34F9EA6FF8636F2C9241153B9114EEFA9E65674A45318AE1EF95BB5F31C53BB2"
         Extracted = "busybox-1.38.0"
