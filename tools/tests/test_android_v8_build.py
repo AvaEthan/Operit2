@@ -88,6 +88,22 @@ class AndroidV8BuildTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "OPERIT_ANDROID_V8_API_LEVEL"):
                 v8.api_level()
 
+    def test_prefixed_ndk_directory_reuses_the_same_v8_cache(self):
+        prefixed = v8.configuration(
+            "152.2.0", "aarch64-linux-android", Path("android-ndk-28.2.13676358")
+        )
+        numeric = v8.configuration(
+            "152.2.0", "aarch64-linux-android", Path("28.2.13676358")
+        )
+        (self.gn_out / "args.gn").write_text("\n".join(
+            f"{key} = {json.dumps(value)}" for key, value in prefixed["gn"].items()))
+        v8.store_artifacts(self.gn_out, self.directory, prefixed)
+        self.assertTrue(v8.cache_valid(self.directory, numeric))
+        older = v8.configuration(
+            "152.2.0", "aarch64-linux-android", Path("27.0.12077973")
+        )
+        self.assertFalse(v8.cache_valid(self.directory, older))
+
     def test_command_output_is_decoded_as_utf8(self):
         completed = subprocess.CompletedProcess(["cargo", "metadata"], 0, stdout="café\n", stderr="")
         with patch.object(v8.subprocess, "run", return_value=completed) as run:
