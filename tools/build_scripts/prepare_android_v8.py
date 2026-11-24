@@ -129,6 +129,33 @@ def ndk_version(ndk):
     return ndk.name
 
 
+def normalized_ndk_version(value):
+    text = str(value).strip()
+    if len(text) >= 2 and text.startswith('"') and text.endswith('"'):
+        text = text[1:-1]
+    match = re.search(r"(\d+\.\d+\.\d+)$", text)
+    return match.group(1) if match else text
+
+
+def configurations_match(actual, expected):
+    if actual == expected:
+        return True
+    actual_gn = actual.get("gn", {})
+    expected_gn = expected.get("gn", {})
+    if normalized_ndk_version(actual_gn.get("android_ndk_version")) != normalized_ndk_version(
+        expected_gn.get("android_ndk_version")
+    ):
+        return False
+    expected = {
+        **expected,
+        "gn": {
+            **expected_gn,
+            "android_ndk_version": actual_gn.get("android_ndk_version"),
+        },
+    }
+    return actual == expected
+
+
 def digest(path):
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
@@ -141,14 +168,20 @@ def check_gn(path, config):
         if match:
             args[match[1]] = match[2]
     for name, value in config["gn"].items():
-        if args.get(name) != json.dumps(value):
-            raise RuntimeError(f"V8 configuration mismatch: {name}={args.get(name)}, expected {value!r}")
+        actual = args.get(name)
+        matches = (
+            normalized_ndk_version(actual) == normalized_ndk_version(value)
+            if name == "android_ndk_version"
+            else actual == json.dumps(value)
+        )
+        if not matches:
+            raise RuntimeError(f"V8 configuration mismatch: {name}={actual}, expected {value!r}")
 
 
 def cache_valid(directory, config):
     try:
         manifest = json.loads((directory / "manifest.json").read_text())
-        if manifest["configuration"] != config:
+        if not configurations_match(manifest["configuration"], config):
             return False
         if any(manifest["sha256"][name] != digest(directory / name) for name in ARTIFACTS):
             return False
