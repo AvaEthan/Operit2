@@ -124,7 +124,7 @@ class AndroidRuntimeAssetsTests(unittest.TestCase):
             output.mkdir(parents=True)
             apk = self.make_apk(output, self.runtime_assets())
             with (
-                patch.object(sys, "argv", ["build_flutter_android.py", "--skip-signing"]),
+                patch.object(sys, "argv", ["build_flutter_android.py", "--skip-signing", "--application-id", "app.operit.test"]),
                 patch.object(android_build, "FLUTTER_APP_DIR", app),
                 patch.object(android_build, "flutter_command", return_value="flutter-test"),
                 patch.object(android_build, "configure_android_flutter_sdk"),
@@ -137,6 +137,7 @@ class AndroidRuntimeAssetsTests(unittest.TestCase):
                 self.assertEqual(android_build.main(), 0)
                 self.assertEqual(publish.call_args.args[0], apk)
                 self.assertIn("--android-project-arg=operitRuntime=app", run.call_args.args[0])
+                self.assertIn("--android-project-arg=operitApplicationId=app.operit.test", run.call_args.args[0])
 
     # Publishes only the versioned APK and never creates a checksum sidecar.
     def test_publishes_full_release_version_without_checksum(self):
