@@ -881,6 +881,48 @@ impl ChatHistoryManager {
         Ok(messageToPersist)
     }
 
+    /// Stages one tool payload for the participant that produced it before its part is persisted.
+    pub fn stageToolResultBlob(
+        &self,
+        chatId: String,
+        participantId: Option<String>,
+        extensionOwner: String,
+        content: String,
+    ) -> ChatHistoryManagerResult<String> {
+        Ok(self
+            .database
+            .messagePartDao()
+            .stageToolResultBlob(&chatId, participantId.as_deref(), &extensionOwner, &content)?)
+    }
+
+    /// Reads one slice of an addressed tool payload that is still owned by this chat.
+    pub fn readToolResultBlob(
+        &self,
+        chatId: String,
+        participantId: Option<String>,
+        extensionOwner: String,
+        hash: String,
+        offset: usize,
+        limit: usize,
+    ) -> ChatHistoryManagerResult<String> {
+        Ok(self
+            .database
+            .messagePartDao()
+            .readToolResultBlob(
+                &chatId,
+                participantId.as_deref(),
+                &extensionOwner,
+                &hash,
+                offset,
+                limit,
+            )?)
+    }
+
+    /// Reclaims staged tool payloads that never reached a message part.
+    pub fn purgeExpiredToolResultBlobs(&self) -> ChatHistoryManagerResult<usize> {
+        Ok(self.database.messagePartDao().purgeExpiredToolResultBlobs()?)
+    }
+
     /// Resolves an anchored message timestamp against the current stored neighbors.
     fn resolveAnchoredMessageLocked(
         &self,

@@ -930,6 +930,18 @@ fn internalToolCategoriesEnSource() -> Vec<SystemToolPromptCategory> {
                     ],
                     "",
                     "",
+                ),
+                tool(
+                    "read_tool_result",
+                    "Read a slice of a previously externalized tool result by its content hash.",
+                    "Use when a tool result contains an externalized marker with hash=...; offset is a character offset.",
+                    vec![
+                        param("hash", "string", "64-character content hash from the externalized result marker", true, None),
+                        param("offset", "integer", "optional, zero-based character offset (default 0)", false, None),
+                        param("limit", "integer", "optional, maximum characters to return (default 8192, max 65536)", false, None)
+                    ],
+                    "",
+                    "",
                 )
             ],
             "",
@@ -2166,6 +2178,18 @@ fn internalToolCategoriesCnSource() -> Vec<SystemToolPromptCategory> {
                         param("chat_id", "string", "目标对话 ID", true, None),
                         param("order", "string", "可选，asc/desc（默认 desc）", false, None),
                         param("limit", "integer", "可选，返回消息条数（默认20，最大200）", false, None)
+                    ],
+                    "",
+                    "",
+                ),
+                tool(
+                    "read_tool_result",
+                    "按内容哈希读取此前外置的工具结果片段。",
+                    "当工具结果包含带 hash=... 的外置标记时使用；offset 为字符偏移量。",
+                    vec![
+                        param("hash", "string", "外置结果标记中的 64 位内容哈希", true, None),
+                        param("offset", "integer", "可选，从 0 开始的字符偏移量（默认 0）", false, None),
+                        param("limit", "integer", "可选，最多返回字符数（默认 8192，最大 65536）", false, None)
                     ],
                     "",
                     "",

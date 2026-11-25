@@ -158,6 +158,7 @@ pub struct ToolResultMap {
     pub catalog_read_tool_sources: CatalogReadToolSourcesResultData,
     pub list_core_nodes: String,
     pub switch_core: String,
+    pub read_tool_result: String,
     pub package_proxy: ToolResultData,
     #[display(action = "wait", icon = "time", target = "execution_id")]
     pub package_wait: JsonResultData,

@@ -70,11 +70,14 @@ use operit_util::ChatUtils::ChatUtils;
 use operit_util::MarkdownRenderStream::MarkdownStreamEvent;
 
 const TAG: &str = "EnhancedAIService";
+/// Provider-facing budget per externalized tool result; the transcript keeps the full payload.
+const TOOL_RESULT_INLINE_LIMIT_CHARS: usize = 4_000;
 
 /// Carries the finalized result of one tool or warning round to the next model request.
 struct ToolResultContinuation {
     results: Vec<ToolResult>,
     message: String,
+    blobHashes: Vec<Option<String>>,
 }
 
 /// Describes the next action without retaining a previous round's execution future.
@@ -2520,6 +2523,7 @@ impl EnhancedAIService {
         chatModelIdOverride: Option<String>,
         stream: bool,
         toolResultMessage: String,
+        blobHashes: Vec<Option<String>>,
         callbacks: Option<Arc<dyn SendMessageCallbacks + Send + Sync>>,
         runtime: &mut SendMessageRuntime,
     ) -> Result<bool, AiServiceError> {
@@ -2586,7 +2590,26 @@ impl EnhancedAIService {
             .normalize_conversation_history_for_model(&context.conversationHistory);
         context.conversationHistory.clear();
         context.conversationHistory.extend(normalizedChatHistory);
-        let currentChatHistory = context.conversationHistory.clone();
+        let mut currentChatHistory = context.conversationHistory.clone();
+        if blobHashes.iter().any(Option::is_some) {
+            for turn in &mut currentChatHistory {
+                if turn.kind == PromptTurnKind::TOOL_RESULT {
+                    match ConversationMarkupManager::projectToolResultMessageForSend(
+                        &turn.content,
+                        &blobHashes,
+                        Some(TOOL_RESULT_INLINE_LIMIT_CHARS),
+                    ) {
+                        Ok(projected) => turn.content = projected,
+                        Err(error) => {
+                            AppLogger::w(
+                                TAG,
+                                &format!("chat.tool_result.projection_failed error={error}"),
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         AppLogger::v_with_level(
             TAG,
@@ -2951,6 +2974,7 @@ impl EnhancedAIService {
                 chatModelIdOverride.clone(),
                 stream,
                 continuation.message,
+                continuation.blobHashes,
                 callbacks.clone(),
                 runtime,
             )
@@ -2995,6 +3019,7 @@ impl EnhancedAIService {
                 return ResponseRoundAction::Continue(ToolResultContinuation {
                     results: Vec::new(),
                     message: emptyResponseWarning,
+                    blobHashes: Vec::new(),
                 });
             }
             AppLogger::v_with_level(
@@ -3032,6 +3057,7 @@ impl EnhancedAIService {
             return ResponseRoundAction::Continue(ToolResultContinuation {
                 results: Vec::new(),
                 message: pureThinkingWarning,
+                blobHashes: Vec::new(),
             });
         }
 
@@ -3200,6 +3226,7 @@ impl EnhancedAIService {
             results: allToolResults,
             message: toolResultMessage,
             displayMessage,
+            blobHashes,
             routeChangeIntent,
         } = toolBatch.map_err(AiServiceError::RequestFailed)?;
         let routeChangeTargetNodeId = routeChangeIntent
@@ -3244,6 +3271,7 @@ impl EnhancedAIService {
         Ok(Some(ToolResultContinuation {
             results: allToolResults,
             message: toolResultMessage,
+            blobHashes,
         }))
     }
 
