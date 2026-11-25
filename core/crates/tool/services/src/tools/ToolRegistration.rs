@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use operit_host_api::HostManager::HostManager;
+use operit_model::MessagePartCodec::is_tool_result_blob_hash;
 use operit_plugin_sdk::js_sdk::tool_types::BuiltinToolName;
 use operit_tools::tools::climode::CliToolModeSupport::{
     CliToolModeSupport, SEARCH_TOOL_NAME,
@@ -268,6 +269,51 @@ fn registerPublicTools(handler: &mut AIToolHandler, context: &HostManager) {
                         success: true,
                         result: stringResultData(targetNodeId),
                         error: None,
+                    }
+                })
+            },
+        }),
+        ToolRegistrationVisibility::PUBLIC,
+    );
+    let blobRuntimeSupport = handler.runtimeSupport();
+    handler.registerBuiltinTool(
+        BuiltinToolName::ReadToolResult,
+        Box::new(FnToolExecutor {
+            effect: ToolEffect::READ,
+            validate: Arc::new(|tool| validateReadToolResultInvocation(tool)),
+            invoke: {
+                let runtimeSupport = blobRuntimeSupport.clone();
+                Arc::new(move |tool| {
+                    let context = match ToolExecutionManager::currentToolRuntimeContext() {
+                        Some(context) => context,
+                        None => return toolErrorResult(tool, "Tool runtime context is unavailable".to_string()),
+                    };
+                    let Some(chatId) = context.callerChatId else {
+                        return toolErrorResult(tool, "read_tool_result requires an active chat".to_string());
+                    };
+                    let hash = requiredParameterValue(tool, "hash");
+                    let offset = requiredParameterValue(tool, "offset")
+                        .parse::<usize>()
+                        .unwrap_or(0);
+                    let limit = requiredParameterValue(tool, "limit")
+                        .parse::<usize>()
+                        .unwrap_or(8_192)
+                        .clamp(1, 65_536);
+                    match runtimeSupport.readToolResultBlob(
+                        chatId,
+                        context.callerParticipantId,
+                        context.extensionOwner,
+                        hash,
+                        offset,
+                        limit,
+                    ) {
+                        Ok(content) => ToolResult {
+                            toolName: tool.name.clone(),
+                            success: true,
+                            result: stringResultData(content),
+                            error: None,
+                        },
+                        Err(error) => toolErrorResult(tool, error),
                     }
                 })
             },
@@ -1577,6 +1623,30 @@ fn requiredParameterValue(tool: &AITool, name: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Validates the content address and optional character window of one read-back request.
+fn validateReadToolResultInvocation(tool: &AITool) -> ToolValidationResult {
+    let hash = requiredParameterValue(tool, "hash");
+    if !is_tool_result_blob_hash(&hash) {
+        return ToolValidationResult {
+            valid: false,
+            errorMessage: "hash must be 64 hexadecimal characters".to_string(),
+        };
+    }
+    for name in ["offset", "limit"] {
+        let value = requiredParameterValue(tool, name);
+        if !value.is_empty() && value.parse::<usize>().is_err() {
+            return ToolValidationResult {
+                valid: false,
+                errorMessage: format!("{name} must be a non-negative integer"),
+            };
+        }
+    }
+    ToolValidationResult {
+        valid: true,
+        errorMessage: String::new(),
+    }
+}
+
 /// Builds an explicit failure result for tool validation or execution errors.
 fn toolErrorResult(tool: &AITool, error: String) -> ToolResult {
     ToolResult {
@@ -1726,6 +1796,46 @@ mod sleep_tests {
         let result = executeSleep(&sleepTool(Some("0")), &HostManager::default()).await;
         assert!(!result.success);
         assert_eq!(result.error.as_deref(), Some("HostRuntimeTaskSchedulerHost is required for sleep"));
+    }
+}
+
+#[cfg(test)]
+mod read_tool_result_tests {
+    use super::*;
+
+    fn readTool(parameters: &[(&str, &str)]) -> AITool {
+        AITool {
+            name: "read_tool_result".to_string(),
+            parameters: parameters
+                .iter()
+                .map(|(name, value)| ToolParameter {
+                    name: (*name).to_string(),
+                    value: (*value).to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn read_tool_result_validates_hash_and_optional_character_window() {
+        let hash = "a".repeat(64);
+        assert!(validateReadToolResultInvocation(&readTool(&[("hash", &hash)])).valid);
+        assert!(validateReadToolResultInvocation(&readTool(&[
+            ("hash", &hash),
+            ("offset", "0"),
+            ("limit", "8192"),
+        ]))
+        .valid);
+        for parameters in [
+            vec![],
+            vec![("hash", "not-a-hash")],
+            vec![("hash", hash.as_str()), ("offset", "-1")],
+            vec![("hash", hash.as_str()), ("limit", "many")],
+        ] {
+            let validation = validateReadToolResultInvocation(&readTool(&parameters));
+            assert!(!validation.valid, "{parameters:?}");
+            assert!(!validation.errorMessage.is_empty());
+        }
     }
 }
 

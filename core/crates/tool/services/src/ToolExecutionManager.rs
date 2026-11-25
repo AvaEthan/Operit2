@@ -15,6 +15,7 @@ use operit_util::AppLogger::AppLogger;
 use operit_util::ChatMarkupRegex::{attr_value, tag_ranges, ChatMarkupRegex};
 
 const TAG: &str = "ToolExecutionManager";
+const READ_TOOL_RESULT_TOOL_NAME: &str = "read_tool_result";
 const PACKAGE_PROXY_TOOL_NAME: &str = "package_proxy";
 const CLI_PROXY_TOOL_NAME: &str = PROXY_TOOL_NAME;
 const CLI_SEARCH_TOOL_NAME: &str = SEARCH_TOOL_NAME;
@@ -305,6 +306,8 @@ pub struct ToolExecutionBatch {
     pub results: Vec<ToolResult>,
     pub message: String,
     pub displayMessage: String,
+    /// Complete payload addresses, aligned with `results`; `None` keeps a result inline.
+    pub blobHashes: Vec<Option<String>>,
     pub routeChangeIntent: Option<RouteChangeIntent>,
 }
 
@@ -315,7 +318,7 @@ impl ToolExecutionBatch {
         let displayMessage = results.iter()
             .map(|result| ConversationMarkupManager::formatToolResultForDisplay(result, None))
             .collect::<Vec<_>>().join("\n");
-        Self { results, message, displayMessage, routeChangeIntent }
+        Self { results, message, displayMessage, blobHashes: Vec::new(), routeChangeIntent }
     }
 }
 
@@ -423,6 +426,7 @@ impl ToolExecutionManager {
             extensionOwner,
             executionData,
         };
+        let extensionOwner = runtimeContext.extensionOwner.clone();
         runtimeContext.validateExecutionContext()?;
         TOOL_BATCH_SEQUENCE.scope(ToolBatchSequence::default(), Self::scopeToolRuntimeContext(runtimeContext, async move {
         let mut toolHandler = toolHandler.clone();
@@ -523,9 +527,51 @@ impl ToolExecutionManager {
             }
         }
 
+        let blobHashes: Vec<Option<String>> = if let Some(chatId) = callerChatId.as_deref() {
+            results
+                .iter()
+                .map(|result| {
+                    if result.toolName == READ_TOOL_RESULT_TOOL_NAME {
+                        return None;
+                    }
+                    let content = ConversationMarkupManager::toolResultPayload(result);
+                    match toolHandler
+                        .runtimeSupport()
+                        .stageToolResultBlob(
+                            chatId.into(),
+                            callerParticipantId.clone(),
+                            extensionOwner.clone(),
+                            content,
+                        ) {
+                        Ok(hash) => Some(hash),
+                        Err(error) => {
+                            AppLogger::w(
+                                TAG,
+                                &format!(
+                                    "tool.execution.blob_stage_failed tool={} error={error}",
+                                    result.toolName
+                                ),
+                            );
+                            None
+                        }
+                    }
+                })
+                .collect()
+        } else {
+            results.iter().map(|_| None).collect()
+        };
         let mut batch = ToolExecutionBatch::new(results, routeChangeIntent);
-        batch.displayMessage = batch.results.iter().zip(&displays)
-            .map(|(result, display)| ConversationMarkupManager::formatToolResultForDisplay(result, display.as_ref()))
+        batch.message = ConversationMarkupManager::buildToolResultMessageWithBlobHashes(
+            &batch.results,
+            &blobHashes,
+        );
+        batch.blobHashes = blobHashes;
+        batch.displayMessage = batch.results.iter().zip(&displays).enumerate()
+            .map(|(index, (result, display))| ConversationMarkupManager::formatToolResultForDisplayWithBlobHash(
+                result,
+                display.as_ref(),
+                batch.blobHashes.get(index).and_then(Option::as_deref),
+            ))
             .collect::<Vec<_>>().join("\n");
         AppLogger::v_with_level(
             TAG,
@@ -582,13 +628,17 @@ impl ToolExecutionManager {
     ) -> Option<ToolResult> {
         let toolName = tool.name.trim();
         let denied = match toolExposureMode {
-            ToolExposureMode::CLI if !Self::isCliPublicTool(toolName) => Some(format!(
-                "{}",
-                CliToolModeSupport::buildCliTopLevelRestrictionErrorMessage(
-                    &Self::resolveDisplayToolName(tool),
-                    true,
-                )
-            )),
+            ToolExposureMode::CLI
+                if !Self::isCliPublicTool(toolName) && toolName != READ_TOOL_RESULT_TOOL_NAME =>
+            {
+                Some(format!(
+                    "{}",
+                    CliToolModeSupport::buildCliTopLevelRestrictionErrorMessage(
+                        &Self::resolveDisplayToolName(tool),
+                        true,
+                    )
+                ))
+            }
             ToolExposureMode::FULL if Self::isCliPublicTool(toolName) => {
                 Some(CliToolModeSupport::buildCliModeUnavailableMessage(true))
             }
@@ -778,6 +828,24 @@ pub struct ToolValidationResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_tool_result_is_available_in_both_exposure_modes() {
+        let tool = AITool {
+            name: READ_TOOL_RESULT_TOOL_NAME.to_string(),
+            parameters: Vec::new(),
+        };
+        assert!(ToolExecutionManager::buildToolExposureDeniedResult(
+            &tool,
+            ToolExposureMode::FULL,
+        )
+        .is_none());
+        assert!(ToolExecutionManager::buildToolExposureDeniedResult(
+            &tool,
+            ToolExposureMode::CLI,
+        )
+        .is_none());
+    }
 
     /// A rejected later turn must not allow another invocation to bypass unfinished earlier work.
     #[tokio::test]

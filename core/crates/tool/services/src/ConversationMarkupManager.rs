@@ -1,4 +1,5 @@
 use crate::tools::ToolExecutionLimits::ToolExecutionLimits;
+use operit_model::MessagePartCodec::{is_tool_result_blob_hash, MessagePartCodec};
 use operit_plugin_sdk::js_sdk::results::ToolResultData;
 use operit_util::ChatMarkupRegex::ChatMarkupRegex;
 use serde::{Deserialize, Serialize};
@@ -35,7 +36,15 @@ impl ConversationMarkupManager {
 
     /// Formats one result within a single Unicode-scalar budget.
     pub fn formatToolResultForMessage(result: &ToolResult) -> String {
-        if result.success {
+        Self::formatToolResultForMessageWithBlobHash(result, None)
+    }
+
+    /// Formats one bounded result and records the address of its complete payload.
+    pub fn formatToolResultForMessageWithBlobHash(
+        result: &ToolResult,
+        blobHash: Option<&str>,
+    ) -> String {
+        let markup = if result.success {
             Self::createBoundedToolResultXml(
                 &result.toolName,
                 "success",
@@ -55,6 +64,23 @@ impl ConversationMarkupManager {
             Self::createBoundedToolResultXml(&result.toolName, "error", &errorPayload, |payload| {
                 format!("<content><error>{payload}</error></content>")
             })
+        };
+        Self::withBlobHashAttribute(markup, blobHash)
+    }
+
+    /// Returns the exact full payload kept under a tool result's content address.
+    pub fn toolResultPayload(result: &ToolResult) -> String {
+        if result.success {
+            return result.result.toString();
+        }
+        let message = result.error.clone().unwrap_or_default().trim().to_string();
+        let detail = result.result.toString().trim().to_string();
+        if !message.is_empty() && !detail.is_empty() {
+            format!("{message}\n\n{detail}")
+        } else if !message.is_empty() {
+            message
+        } else {
+            detail
         }
     }
 
@@ -63,7 +89,16 @@ impl ConversationMarkupManager {
         result: &ToolResult,
         display: Option<&operit_plugin_sdk::js_sdk::tool_display::ToolDisplayDeclaration>,
     ) -> String {
-        let mut markup = Self::formatToolResultForMessage(result);
+        Self::formatToolResultForDisplayWithBlobHash(result, display, None)
+    }
+
+    /// Adds structured UI metadata and the complete payload's address to one bounded result.
+    pub fn formatToolResultForDisplayWithBlobHash(
+        result: &ToolResult,
+        display: Option<&operit_plugin_sdk::js_sdk::tool_display::ToolDisplayDeclaration>,
+        blobHash: Option<&str>,
+    ) -> String {
+        let mut markup = Self::formatToolResultForMessageWithBlobHash(result, blobHash);
         let mut attributes = String::new();
         let mut append = |name: &str, value: String| {
             let escaped = value
@@ -102,11 +137,45 @@ impl ConversationMarkupManager {
 
     /// Bounds each result independently while preserving every result slot in invocation order.
     pub fn buildToolResultMessage(results: &[ToolResult]) -> String {
+        Self::buildToolResultMessageWithBlobHashes(results, &[])
+    }
+
+    /// Bounds each result and records the address of its complete payload.
+    pub fn buildToolResultMessageWithBlobHashes(
+        results: &[ToolResult],
+        blobHashes: &[Option<String>],
+    ) -> String {
         results
             .iter()
-            .map(Self::formatToolResultForMessage)
+            .enumerate()
+            .map(|(index, result)| {
+                Self::formatToolResultForMessageWithBlobHash(
+                    result,
+                    blobHashes.get(index).and_then(Option::as_deref),
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Replaces referenced oversized tool payloads with bounded read-back previews for the provider.
+    pub fn projectToolResultMessageForSend(
+        message: &str,
+        blobHashes: &[Option<String>],
+        inlineLimit: Option<usize>,
+    ) -> Result<String, String> {
+        let Some(limit) = inlineLimit
+            .filter(|limit| *limit > 0)
+            .filter(|_| blobHashes.iter().any(Option::is_some))
+        else {
+            return Ok(message.to_string());
+        };
+        let parts = MessagePartCodec::parseAssistantMarkup(message)
+            .map_err(|error| format!("Cannot project tool results for send: {error}"))?;
+        Ok(MessagePartCodec::assistantMarkupWithToolResultLimit(
+            &parts,
+            Some(limit),
+        ))
     }
 
     /// Creates the error message for an unavailable tool.
@@ -120,6 +189,19 @@ impl ConversationMarkupManager {
             }
         };
         Self::createToolErrorStatus(toolName, errorMessage)
+    }
+
+    /// Records a valid content address on the opening tag without touching the bounded payload.
+    fn withBlobHashAttribute(markup: String, blobHash: Option<&str>) -> String {
+        let Some(hash) = blobHash.filter(|hash| is_tool_result_blob_hash(hash)) else {
+            return markup;
+        };
+        let Some(end) = markup.find('>') else {
+            return markup;
+        };
+        let mut markup = markup;
+        markup.insert_str(end, &format!(" blob_hash=\"{hash}\""));
+        markup
     }
 
     /// Wraps a tool payload in one uniquely named result element.
@@ -176,6 +258,79 @@ mod tests {
         TerminalImplementation, TerminalType, ToolResultData,
     };
     use operit_tools::ConversationMarkupManager::{ConversationMarkupManager, ToolResult};
+
+    #[test]
+    fn blob_hash_is_recorded_on_message_and_display_but_not_sent_to_provider() {
+        use operit_model::MessagePartCodec::MessagePartCodec;
+        let hash = "a".repeat(64);
+        let result = ToolResult {
+            toolName: "read_file".into(),
+            success: true,
+            error: None,
+            result: ToolResultData::StringResultData(StringResultData { value: "payload".into() }),
+        };
+        let markup = ConversationMarkupManager::formatToolResultForMessageWithBlobHash(
+            &result,
+            Some(&hash),
+        );
+        assert!(markup.contains(&format!("blob_hash=\"{hash}\"")));
+        let display = ConversationMarkupManager::formatToolResultForDisplayWithBlobHash(
+            &result,
+            None,
+            Some(&hash),
+        );
+        assert!(display.contains(&format!("blob_hash=\"{hash}\"")));
+        let parsed = MessagePartCodec::parseAssistantMarkup(&markup).unwrap();
+        let part = parsed
+            .iter()
+            .find(|part| part.kind == operit_model::MessagePart::MessagePartKind::ToolResult)
+            .unwrap();
+        assert_eq!(part.attributes.get("blob_hash").map(String::as_str), Some(hash.as_str()));
+        assert!(!MessagePartCodec::assistantMarkup(std::slice::from_ref(part)).contains("blob_hash="));
+
+        let invalid = ConversationMarkupManager::formatToolResultForMessageWithBlobHash(
+            &result,
+            Some("not-a-hash"),
+        );
+        assert!(!invalid.contains("blob_hash="));
+    }
+
+    #[test]
+    fn provider_projection_replaces_only_referenced_oversized_results() {
+        let hash = "b".repeat(64);
+        let content = "x".repeat(5_000);
+        let result = ToolResult {
+            toolName: "read_file".into(),
+            success: true,
+            error: None,
+            result: ToolResultData::StringResultData(StringResultData {
+                value: content.clone(),
+            }),
+        };
+        let message = ConversationMarkupManager::buildToolResultMessageWithBlobHashes(
+            std::slice::from_ref(&result),
+            &[Some(hash.clone())],
+        );
+        assert!(message.contains(&content));
+        let projected = ConversationMarkupManager::projectToolResultMessageForSend(
+            &message,
+            &[Some(hash)],
+            Some(500),
+        )
+        .unwrap();
+        assert!(!projected.contains(&content));
+        assert!(projected.contains("read_tool_result"));
+        assert!(!projected.contains("blob_hash="));
+        assert_eq!(
+            ConversationMarkupManager::projectToolResultMessageForSend(
+                &message,
+                &[None],
+                Some(500),
+            )
+            .unwrap(),
+            message
+        );
+    }
 
     #[test]
     fn display_metadata_preserves_native_result_type_and_stays_out_of_provider_text() {

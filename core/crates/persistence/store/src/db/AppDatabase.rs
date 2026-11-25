@@ -14,7 +14,7 @@ use operit_model::MessagePartCodec::MessagePartCodec;
 use operit_model::MessagePartEntity::MessagePartEntity;
 
 /// Current SQLite schema version expected by the runtime.
-pub const DATABASE_VERSION: i32 = 30;
+pub const DATABASE_VERSION: i32 = 31;
 
 #[derive(Debug, Error)]
 /// Error surface for opening and migrating the application database.
@@ -69,6 +69,7 @@ impl AppDatabase {
             store: SqliteStore::open(paths.sqlite_database_path())?,
         });
         database.openWithMigrations()?;
+        database.messagePartDao().purgeExpiredToolResultBlobs()?;
         *instance = Some(database.clone());
         Ok(database)
     }
@@ -95,6 +96,7 @@ impl AppDatabase {
     pub fn restoreDatabaseFile(&self, copy: impl FnOnce() -> Result<(), SqliteStoreError>) -> Result<(), AppDatabaseError> {
         self.store.withIdleConversations(|| self.store.withDatabaseFile(copy))?;
         self.openWithMigrations()?;
+        self.messagePartDao().purgeExpiredToolResultBlobs()?;
         self.store.notifyInvalidated()?;
         Ok(())
     }
@@ -147,6 +149,7 @@ impl AppDatabase {
             27 => MIGRATION_27_28(self)?,
             28 => MIGRATION_28_29(self)?,
             29 => MIGRATION_29_30(self)?,
+            30 => MIGRATION_30_31(self)?,
             version => {
                 return Err(AppDatabaseError::MissingMigration {
                     from: version,
@@ -181,6 +184,8 @@ impl AppDatabase {
             DROP TABLE IF EXISTS sync_sql_chat_rows;
             DROP TABLE IF EXISTS sync_sql_operations;
             DROP TABLE IF EXISTS sync_sql_clocks;
+            DROP TABLE IF EXISTS pending_tool_result_blobs;
+            DROP TABLE IF EXISTS tool_result_blobs;
             "#,
         )
     }
@@ -1080,6 +1085,27 @@ pub fn createAllTables(store: &SqliteStore) -> Result<(), SqliteStoreError> {
         );
         CREATE INDEX IF NOT EXISTS index_message_parts_chatId_messageTimestamp
             ON message_parts(chatId, messageTimestamp, variantIndex, sequence);
+
+        CREATE TABLE tool_result_blobs (
+            chatId TEXT NOT NULL,
+            hash TEXT NOT NULL,
+            bytes INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            PRIMARY KEY(chatId, hash)
+        );
+        CREATE INDEX IF NOT EXISTS index_tool_result_blobs_chatId ON tool_result_blobs(chatId);
+
+        CREATE TABLE pending_tool_result_blobs (
+            chatId TEXT NOT NULL,
+            hash TEXT NOT NULL,
+            participantId TEXT,
+            participantKey TEXT NOT NULL,
+            extensionOwner TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY(chatId, hash, participantKey, extensionOwner)
+        );
+        CREATE INDEX IF NOT EXISTS index_pending_tool_result_blobs_created_at ON pending_tool_result_blobs(created_at);
         "#,
     )?;
     createUsageRequestRecordsTable(store)?;
@@ -1367,6 +1393,38 @@ fn MIGRATION_29_30(database: &AppDatabase) -> Result<(), SqliteStoreError> {
             }
         }
         transaction.execute("PRAGMA user_version = 30", Vec::new())?;
+        Ok(())
+    })
+}
+
+/// Stores repeated tool payloads once per chat so the transcript can keep a hash
+/// stub instead of the full output, and tracks staged outputs that no part references yet.
+fn MIGRATION_30_31(database: &AppDatabase) -> Result<(), SqliteStoreError> {
+    database.store.transaction(|transaction| {
+        for statement in [
+            r#"CREATE TABLE IF NOT EXISTS tool_result_blobs (
+                chatId TEXT NOT NULL,
+                hash TEXT NOT NULL,
+                bytes INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                PRIMARY KEY(chatId, hash)
+            )"#,
+            "CREATE INDEX IF NOT EXISTS index_tool_result_blobs_chatId ON tool_result_blobs(chatId)",
+            r#"CREATE TABLE IF NOT EXISTS pending_tool_result_blobs (
+                chatId TEXT NOT NULL,
+                hash TEXT NOT NULL,
+                participantId TEXT,
+                participantKey TEXT NOT NULL,
+                extensionOwner TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY(chatId, hash, participantKey, extensionOwner)
+            )"#,
+            "CREATE INDEX IF NOT EXISTS index_pending_tool_result_blobs_created_at ON pending_tool_result_blobs(created_at)",
+            "PRAGMA user_version = 31",
+        ] {
+            transaction.execute(statement, Vec::new())?;
+        }
         Ok(())
     })
 }
