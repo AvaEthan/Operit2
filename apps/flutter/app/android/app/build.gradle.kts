@@ -143,6 +143,11 @@ val selectedOperitRustTargets = selectedOperitRustTargets(operitRustTargets)
 val operitRuntime = providers.gradleProperty("operitRuntime").getOrElse("app")
 require(operitRuntime in setOf("app", "module")) { "Unsupported operitRuntime=$operitRuntime" }
 val operitExternalRuntime = operitRuntime == "module"
+val operitApplicationId = if (operitExternalRuntime) {
+    "app.operit.module"
+} else {
+    providers.gradleProperty("operitApplicationId").orNull ?: "app.operit"
+}
 val operitModuleAndroid = layout.projectDirectory.dir("../../../../android-module/android")
 
 android {
@@ -172,7 +177,8 @@ android {
     }
 
     defaultConfig {
-        applicationId = if (operitExternalRuntime) "app.operit.module" else "app.operit"
+        applicationId = operitApplicationId
+        resValue("string", "operit_target_package", operitApplicationId)
         manifestPlaceholders["operitAppLabel"] = if (operitExternalRuntime) "Operit2 (Module)" else "Operit2"
         manifestPlaceholders["operitShortcuts"] = if (operitExternalRuntime) "@xml/module_shortcuts" else "@xml/shortcuts"
         buildConfigField("boolean", "OPERIT_EXTERNAL_RUNTIME", operitExternalRuntime.toString())

@@ -122,6 +122,7 @@ jobs:
       RUSTFLAGS: -Awarnings
       RUST_TOOLCHAIN_VERSION: 1.95.0
       FVM_VERSION: 4.3.0
+      ORG_GRADLE_PROJECT_operitApplicationId: app.operit.test
 
     steps:
       - name: Checkout
