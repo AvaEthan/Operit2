@@ -526,11 +526,10 @@ impl ClaudeProvider {
                 .into_iter()
                 .next()
                 .and_then(|(start, end)| {
-                    let raw = &block.body[start..end];
-                    raw.split_once('>').and_then(|(_, tail)| {
-                        tail.rsplit_once("</")
-                            .map(|(body, _)| body.trim().to_string())
-                    })
+                    operit_model::MessagePartCodec::toolResultContentFromMarkup(
+                        &block.body[start..end],
+                    )
+                    .map(|content| content.trim().to_string())
                 })
                 .unwrap_or_else(|| block.body.trim().to_string());
             result_blocks.push(json!({

@@ -15,6 +15,7 @@ use thiserror::Error;
 
 use crate::dao::ChatDao::ChatDao;
 use crate::dao::MessageDao::MessageDao;
+use crate::dao::MessagePartDao::collectUnreferencedToolResultBlobsInTransaction;
 use crate::db::AppDatabase::{AppDatabase, AppDatabaseError};
 use operit_model::ChatEntity::ChatEntity;
 use operit_model::ChatMessagePresentation::{ChatMessagePresentation, PRESENTATION_EXTENSION};
@@ -1397,6 +1398,10 @@ fn applyDeletion(
     match deletion.tableName.as_str() {
         DELETE_CHAT => {
             transaction.execute(
+                "DELETE FROM pending_tool_result_blobs WHERE chatId = ?1",
+                sqliteParams![deletion.chatId],
+            )?;
+            transaction.execute(
                 "DELETE FROM chats WHERE id = ?1",
                 sqliteParams![deletion.chatId],
             )?;
@@ -1483,6 +1488,7 @@ fn applyDeletion(
             )));
         }
     }
+    collectUnreferencedToolResultBlobsInTransaction(transaction)?;
     Ok(())
 }
 
@@ -1568,6 +1574,7 @@ fn replacePartRows(
             )?;
         }
     }
+    collectUnreferencedToolResultBlobsInTransaction(transaction)?;
     Ok(())
 }
 

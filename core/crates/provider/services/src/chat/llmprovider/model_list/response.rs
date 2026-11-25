@@ -106,6 +106,7 @@ fn read_context(
     match max_context_length {
         Some(max_context_length) => Ok(Some(ModelContextSpec {
             maxContextLength: max_context_length / 1000.0,
+            ..ModelContextSpec::default()
         })),
         None => Ok(None),
     }

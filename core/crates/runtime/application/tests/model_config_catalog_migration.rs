@@ -24,6 +24,7 @@ fn staleModel(id: &str) -> ModelProfile {
     model.pricingOverride = Some(ModelPricing::token(99.0, None, 99.0, PricingCurrency::USD));
     model.contextOverride = Some(ModelContextSpec {
         maxContextLength: 8.0,
+        ..ModelContextSpec::default()
     });
     model.capabilitiesOverride = ModelCapabilityOverrides {
         directImage: Some(false),
@@ -36,6 +37,7 @@ fn staleModel(id: &str) -> ModelProfile {
     model.listed = Some(ModelListedSpec {
         context: Some(ModelContextSpec {
             maxContextLength: 4.0,
+            ..ModelContextSpec::default()
         }),
         capabilities: Some(ModelCapabilities::default()),
         supportsStructuredTools: Some(false),

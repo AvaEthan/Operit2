@@ -558,6 +558,7 @@ fn buildModelProfile(modelId: &str, config: &Operit1ModelConfig) -> Result<Model
     let mut model = ModelProfile::new(modelId.to_string());
     model.contextOverride = Some(ModelContextSpec {
         maxContextLength: config.maxContextLength,
+        ..ModelContextSpec::default()
     });
     // Operit1 stored these as the user's settings, so they stay the user's here.
     model.capabilitiesOverride = ModelCapabilityOverrides {
@@ -573,6 +574,8 @@ fn buildModelProfile(modelId: &str, config: &Operit1ModelConfig) -> Result<Model
     model.summary = ModelSummarySettings {
         enableSummary: config.enableSummary,
         summaryTokenThreshold: config.summaryTokenThreshold,
+        summarySoftThresholdTokens: None,
+        summaryDebounceTokens: None,
     };
     model.localRuntime.mnnForwardType = config.mnnForwardType;
     model.localRuntime.mnnThreadCount = config.mnnThreadCount;

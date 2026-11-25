@@ -620,6 +620,7 @@ impl ModelConfigManager {
         let inherited = ModelSpecResolver::new(&provider)?.inherited(&model);
         model.contextOverride = ModelSpecResolver::contextOverride(&inherited, ModelContextSpec {
             maxContextLength: ModelContextSpec::normalize_length(f64::from(context.maxContextLength)),
+            ..Default::default()
         });
         self.updateModelProfile(providerId, model)
     }
@@ -1585,6 +1586,7 @@ impl ModelConfigManager {
             if model.contextOverride.is_none() {
                 model.contextOverride = Some(ModelContextSpec {
                     maxContextLength: model.localRuntime.llamaContextSize as f32 / 1000.0,
+                    ..ModelContextSpec::default()
                 });
             }
             if model.capabilitiesOverride.toolCall.is_none() {
@@ -2366,6 +2368,7 @@ mod tests {
             serde_json::to_value(ModelSummarySettings {
                 enableSummary: false,
                 summaryTokenThreshold: 0.92,
+                ..ModelSummarySettings::default()
             }).unwrap()
         );
         let exported: Vec<ProviderProfile> = serde_json::from_str(
@@ -2566,6 +2569,7 @@ mod tests {
                         Some(ModelListedSpec {
                             context: Some(ModelContextSpec {
                                 maxContextLength: context,
+                                ..ModelContextSpec::default()
                             }),
                             ..ModelListedSpec::default()
                         }),

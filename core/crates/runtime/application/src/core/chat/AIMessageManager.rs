@@ -6,12 +6,12 @@ use crate::core::chat::plugins::MessageProcessingPluginRegistry::{
     MessageProcessingHookParams, MessageProcessingPluginRegistry,
 };
 use crate::data::preferences::ApiPreferences::ApiPreferences;
-use operit_vfs::VisualFileSystem::VisualFileSystem;
 use operit_host_api::HostManager::defaultHostRuntimeTaskSchedulerHost;
 use operit_model::AttachmentInfo::AttachmentInfo;
 use operit_model::ChatMessage::ChatMessage;
 use operit_model::ChatMessageTimestampAllocator::ChatMessageTimestampAllocator;
 use operit_model::MessagePart::{MessagePart, MessagePartKind};
+use operit_model::MessagePartCodec::is_tool_result_blob_hash;
 use operit_model::MessagePartCodec::MessagePartCodec;
 use operit_model::PromptFunctionType::PromptFunctionType;
 use operit_model::PromptTurn::{PromptTurn, PromptTurnKind};
@@ -19,8 +19,8 @@ use operit_providers::chat::enhance::InputProcessor::{InputProcessor, ProcessUse
 use operit_providers::chat::llmprovider::AIService::{AiServiceError, SharedAiResponseStream};
 use operit_providers::chat::llmprovider::MediaLinkParser::MediaLinkParser;
 use operit_providers::chat::EnhancedAIService::{
-    ChatGuidanceInbox, EnhancedAIService, MessageCancellationToken, ResumeRequest,
-    SendMessageCallbacks, SendMessageOptions, SendMessageRuntime,
+    ChatGuidanceInbox, EnhancedAIService, MessageCancellationToken, PromptPreparationPurpose,
+    ResumeRequest, SendMessageCallbacks, SendMessageOptions, SendMessageRuntime,
 };
 use operit_providers::runtime_support::ChatConfigurationResult;
 use operit_store::CoreNodeIdentityStore::CoreNodeIdentityStore;
@@ -33,12 +33,15 @@ use operit_util::ChatMarkupRegex::ChatMarkupRegex;
 use operit_util::ImagePoolManager::ImagePoolManager;
 use operit_util::MediaLinkBuilder::MediaLinkBuilder;
 use operit_util::MediaPoolManager::MediaPoolManager;
+use operit_vfs::VisualFileSystem::VisualFileSystem;
 
 const DEFAULT_CHAT_KEY: &str = "__DEFAULT_CHAT__";
 const MESSAGE_PROCESS_TIMING_TAG: &str = "MessageProcessTiming";
 /// Bounds the appended review independently of the model-generated summary.
 const MAX_CONVERSATION_REVIEW_ENTRIES: usize = 100;
 const CONVERSATION_REVIEW_HEAD_ENTRIES: usize = 30;
+const SUMMARY_TAIL_USER_TURNS: usize = 4;
+const SUMMARY_ACCOUNTING_EXTENSION: &str = "operit.host.context-summary";
 
 pub struct AIMessageManager;
 
@@ -188,7 +191,10 @@ pub fn logMessageTiming(stage: &str, startTimeMs: MessageTiming, details: Option
 
 impl AIMessageManager {
     /// Records execution ownership and the assistant's display identity separately.
-    pub fn applyConfigurationIdentity(message: &mut ChatMessage, configuration: &ChatConfigurationResult) {
+    pub fn applyConfigurationIdentity(
+        message: &mut ChatMessage,
+        configuration: &ChatConfigurationResult,
+    ) {
         if message.sender == "ai" {
             message.pluginExtensions.insert(
                 "host.chat.identity".into(),
@@ -298,14 +304,24 @@ impl AIMessageManager {
 
     /// Serializes original user-only input without selecting a participant, invoking a model, or rewriting submitted text.
     pub(crate) fn buildRecordedUserMessageContent(
-        text: &str, attachments: &[AttachmentInfo], reply: Option<&ChatMessage>,
+        text: &str,
+        attachments: &[AttachmentInfo],
+        reply: Option<&ChatMessage>,
     ) -> Result<String, String> {
         let mut parts = vec![text.to_string()];
         for attachment in attachments {
-            parts.push(Self::buildAttachmentTag(attachment, None, false, false, false)?);
+            parts.push(Self::buildAttachmentTag(
+                attachment, None, false, false, false,
+            )?);
         }
-        if let Some(reply) = reply { parts.push(Self::buildReplyTag(reply)); }
-        Ok(parts.into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join(" "))
+        if let Some(reply) = reply {
+            parts.push(Self::buildReplyTag(reply));
+        }
+        Ok(parts
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" "))
     }
 
     #[allow(non_snake_case)]
@@ -350,7 +366,10 @@ impl AIMessageManager {
 
         let memory = match request.promptHistoryOverride.clone() {
             Some(promptHistory) => promptHistory,
-            None => Self::getMemoryFromMessages(request.chatHistory.clone(), &request.chatConfiguration)?,
+            None => Self::getMemoryFromMessages(
+                request.chatHistory.clone(),
+                &request.chatConfiguration,
+            )?,
         };
 
         let apiPreferences = ApiPreferences::getInstance();
@@ -535,56 +554,73 @@ impl AIMessageManager {
         autoContinue: bool,
         chatId: String,
         configuration: &ChatConfigurationResult,
-        progress: Option<operit_providers::chat::enhance::ConversationService::SummaryProgressCallback>,
-        trigger: Option<operit_providers::chat::enhance::ConversationService::SummaryTriggerContext>,
+        progress: Option<
+            operit_providers::chat::enhance::ConversationService::SummaryProgressCallback,
+        >,
+        trigger: Option<
+            operit_providers::chat::enhance::ConversationService::SummaryTriggerContext,
+        >,
         onNonFatalError: Arc<dyn Fn(String) + Send + Sync>,
+        preserveRecentTurns: bool,
     ) -> Result<Option<ChatMessage>, operit_providers::chat::llmprovider::AIService::AiServiceError>
     {
         let lastSummaryIndex = messages
             .iter()
             .rposition(|message| message.sender == "summary");
         let previousSummary = lastSummaryIndex.and_then(|index| {
-            let content = messages[index].displayText().trim().to_string();
-            if content.is_empty() {
+            let content = removePreviousConversationReview(&messages[index].displayText());
+            if content.trim().is_empty() {
                 None
             } else {
                 Some(content)
             }
         });
 
-        let messagesToSummarize = match lastSummaryIndex {
-            Some(index) => messages[index + 1..]
-                .iter()
-                .filter(|message| message.sender == "user" || message.sender == "ai")
-                .cloned()
-                .collect::<Vec<_>>(),
-            None => messages
-                .iter()
-                .filter(|message| message.sender == "user" || message.sender == "ai")
-                .cloned()
-                .collect::<Vec<_>>(),
-        };
+        let messagesToSummarize =
+            summarySourceMessages(&messages, lastSummaryIndex, preserveRecentTurns);
 
         if messagesToSummarize.is_empty() {
             return Ok(None);
         }
 
         let mut conversationReviewEntries = Vec::<(String, String)>::new();
-        let conversationToSummarize = messagesToSummarize.iter().enumerate().map(|(index, message)| {
-            let role = match message.sender.as_str() { "user" => "user", _ => "assistant" }.to_string();
-            let cleanedContent = cleanSummarySourceMessage(message);
-            if !cleanedContent.trim().is_empty() {
-                let displayContent = if message.sender == "ai" {
-                    condenseAssistantMessageForReview(message)
-                } else { condenseUserForReview(&cleanedContent) };
-                conversationReviewEntries.push((summarySpeakerLabel(message), displayContent));
-            }
-            (role, format!("#{}: {cleanedContent}", index + 1))
-        }).collect::<Vec<_>>();
+        let conversationToSummarize = messagesToSummarize
+            .iter()
+            .enumerate()
+            .map(|(index, message)| {
+                let role = match message.sender.as_str() {
+                    "user" => "user",
+                    _ => "assistant",
+                }
+                .to_string();
+                let sourceMessage = summaryMessageForParticipant(message, configuration);
+                let cleanedContent = cleanSummarySourceMessage(
+                    &sourceMessage,
+                    configuration.toolResultInlineLimitChars(),
+                );
+                if !cleanedContent.trim().is_empty() {
+                    let displayContent = if message.sender == "ai" {
+                        condenseAssistantMessageForReview(&sourceMessage)
+                    } else {
+                        condenseUserForReview(&cleanedContent)
+                    };
+                    conversationReviewEntries.push((summarySpeakerLabel(message), displayContent));
+                }
+                (role, format!("#{}: {cleanedContent}", index + 1))
+            })
+            .collect::<Vec<_>>();
 
         let startTime = ChatMessageTimestampAllocator::currentTimeMillis();
         let (summary, usage) = enhancedAiService
-            .generateSummaryForConfiguration(conversationToSummarize, previousSummary, chatId, configuration, progress, trigger, onNonFatalError)
+            .generateSummaryForConfiguration(
+                conversationToSummarize,
+                previousSummary,
+                chatId,
+                configuration,
+                progress,
+                trigger,
+                onNonFatalError,
+            )
             .await?;
         let endTime = ChatMessageTimestampAllocator::currentTimeMillis();
         if summary.trim().is_empty() {
@@ -628,7 +664,8 @@ impl AIMessageManager {
     pub async fn calculateStableContextWindow(
         request: StableContextWindowRequest<'_>,
     ) -> Result<i64, operit_providers::chat::llmprovider::AIService::AiServiceError> {
-        let memory = Self::getMemoryFromMessages(request.chatHistory, &request.runtime.chatConfiguration)?;
+        let memory =
+            Self::getMemoryFromMessages(request.chatHistory, &request.runtime.chatConfiguration)?;
         request
             .enhancedAiService
             .estimateRequestWindowFromMemory(
@@ -648,6 +685,97 @@ impl AIMessageManager {
             .await
     }
 
+    /// Returns the checkpoint position shared by summary source slicing and persistence.
+    pub(crate) fn summaryInsertPosition(
+        messages: &[ChatMessage],
+        lastSummaryIndex: Option<usize>,
+        preserveRecentTurns: bool,
+    ) -> Option<usize> {
+        let start = lastSummaryIndex.map_or(0, |index| index + 1);
+        let candidates = messages[start..]
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.sender == "user" || message.sender == "ai")
+            .map(|(index, message)| (start + index, message))
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return None;
+        }
+        if !preserveRecentTurns {
+            return Some(messages.len());
+        }
+        let tailStart = candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, message))| message.sender == "user")
+            .rev()
+            .nth(SUMMARY_TAIL_USER_TURNS.saturating_sub(1))
+            .map_or(candidates.len(), |(index, _)| index);
+        (tailStart > 0 && tailStart < candidates.len()).then(|| candidates[tailStart].0)
+    }
+
+    pub(crate) fn summaryAccountingStart(
+        messages: &[ChatMessage],
+        lastSummaryIndex: Option<usize>,
+    ) -> usize {
+        let Some(index) = lastSummaryIndex else {
+            return 0;
+        };
+        let start = index + 1;
+        let baseline = messages[index]
+            .pluginExtensions
+            .get(SUMMARY_ACCOUNTING_EXTENSION);
+        let timestampStart = baseline
+            .and_then(|value| value.get("baselineTimestamp"))
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|timestamp| {
+                messages[start..]
+                    .iter()
+                    .position(|message| message.timestamp > timestamp)
+                    .map_or(Some(messages.len()), |offset| Some(start + offset))
+            })
+            .unwrap_or(start);
+        let variantStart = baseline
+            .and_then(|value| value.get("selectedVariants"))
+            .and_then(serde_json::Value::as_object)
+            .and_then(|variants| {
+                messages[start..].iter().position(|message| {
+                    variants
+                        .get(&message.timestamp.to_string())
+                        .and_then(serde_json::Value::as_i64)
+                        .is_some_and(|index| index != i64::from(message.selectedVariantIndex))
+                })
+            })
+            .map_or(messages.len(), |offset| start + offset);
+        timestampStart.min(variantStart)
+    }
+
+    pub(crate) fn markSummaryAccountingBaseline(
+        summary: &mut ChatMessage,
+        summarizedThrough: Option<i64>,
+        retainedMessages: &[ChatMessage],
+    ) {
+        let selectedVariants = retainedMessages
+            .iter()
+            .map(|message| {
+                (
+                    message.timestamp.to_string(),
+                    serde_json::json!(message.selectedVariantIndex),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        if summarizedThrough.is_none() && selectedVariants.is_empty() {
+            return;
+        }
+        summary.pluginExtensions.insert(
+            SUMMARY_ACCOUNTING_EXTENSION.into(),
+            serde_json::json!({
+                "baselineTimestamp": summarizedThrough,
+                "selectedVariants": selectedVariants,
+            }),
+        );
+    }
+
     #[allow(non_snake_case)]
     /// Automatic summaries depend only on the configured context token threshold.
     pub fn shouldGenerateSummary(
@@ -658,68 +786,242 @@ impl AIMessageManager {
     ) -> bool {
         enableSummary
             && maxTokens > 0
-            && currentTokens as f64 / f64::from(maxTokens) >= tokenUsageThreshold
+            && currentTokens as f64 / f64::from(maxTokens)
+                >= (tokenUsageThreshold - f64::from(f32::EPSILON)).max(0.0)
     }
 
     /// Projects history using persisted participant identities and the owner's explicit history policy.
     #[allow(non_snake_case)]
     pub fn getMemoryFromMessages(
-        messages: Vec<ChatMessage>, configuration: &ChatConfigurationResult,
+        messages: Vec<ChatMessage>,
+        configuration: &ChatConfigurationResult,
     ) -> Result<Vec<PromptTurn>, AiServiceError> {
-        let lastSummaryIndex = messages.iter().rposition(|message| message.sender == "summary");
-        let relevantMessages = match lastSummaryIndex { Some(index) => &messages[index..], None => messages.as_slice() };
+        let lastSummaryIndex = messages
+            .iter()
+            .rposition(|message| message.sender == "summary");
+        let relevantMessages = match lastSummaryIndex {
+            Some(index) => &messages[index..],
+            None => messages.as_slice(),
+        };
         let mut turns = Vec::new();
-        for message in relevantMessages {
+        let foldedTurns = if configuration.foldMiddleTurns {
+            Self::foldedMiddleTurns(relevantMessages, configuration)
+        } else {
+            vec![None; relevantMessages.len()]
+        };
+        for (index, message) in relevantMessages.iter().enumerate() {
+            if let Some(folded) = &foldedTurns[index] {
+                if !folded.trim().is_empty() {
+                    turns.push(PromptTurn::new(PromptTurnKind::USER, folded.clone()));
+                }
+                continue;
+            }
             match message.sender.as_str() {
                 "ai" if configuration.historyPolicy.isolateParticipants => {
-                    let author = message.pluginExtensions.get(&configuration.extensionOwner)
+                    let author = message
+                        .pluginExtensions
+                        .get(&configuration.extensionOwner)
                         .and_then(|identity| identity.get("participantId"))
                         .and_then(serde_json::Value::as_str)
                         .filter(|id| !id.trim().is_empty())
-                        .ok_or_else(|| AiServiceError::RequestFailed(format!(
-                            "History message has no recorded participant: {}", message.timestamp)))?;
+                        .ok_or_else(|| {
+                            AiServiceError::RequestFailed(format!(
+                                "History message has no recorded participant: {}",
+                                message.timestamp
+                            ))
+                        })?;
                     if author == configuration.profile.id {
-                        turns.extend(Self::assistantPromptTurnsFromParts(message));
+                        turns.extend(Self::assistantPromptTurnsFromParts(
+                            message,
+                            configuration.toolResultInlineLimitChars(),
+                        ));
                     } else {
-                        let name = message.pluginExtensions.get("host.chat.identity")
+                        let name = message
+                            .pluginExtensions
+                            .get("host.chat.identity")
                             .and_then(|identity| identity.get("title"))
                             .and_then(serde_json::Value::as_str)
                             .filter(|name| !name.trim().is_empty())
-                            .ok_or_else(|| AiServiceError::RequestFailed(format!(
-                                "History message has no recorded display identity: {}", message.timestamp)))?;
-                        let speech = MessagePartCodec::orderedParts(&message.parts).into_iter()
+                            .ok_or_else(|| {
+                                AiServiceError::RequestFailed(format!(
+                                    "History message has no recorded display identity: {}",
+                                    message.timestamp
+                                ))
+                            })?;
+                        let speech = MessagePartCodec::orderedParts(&message.parts)
+                            .into_iter()
                             .filter(|part| part.kind == MessagePartKind::Markdown)
-                            .map(|part| part.content.as_str()).collect::<Vec<_>>().join("\n");
+                            .map(|part| part.content.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n");
                         if !speech.trim().is_empty() {
-                            turns.push(PromptTurn::new(PromptTurnKind::USER,
-                                format!("[From role: {name}]\n{}", speech.trim())));
+                            turns.push(PromptTurn::new(
+                                PromptTurnKind::USER,
+                                format!("[From role: {name}]\n{}", speech.trim()),
+                            ));
                         }
                     }
                 }
-                "ai" => turns.extend(Self::assistantPromptTurnsFromParts(message)),
+                "ai" => turns.extend(Self::assistantPromptTurnsFromParts(
+                    message,
+                    configuration.toolResultInlineLimitChars(),
+                )),
                 "user" => {
                     let content = message.displayText();
-                    let content = if configuration.historyPolicy.labelUserMessages && !content.trim().is_empty() {
+                    let content = if configuration.historyPolicy.labelUserMessages
+                        && !content.trim().is_empty()
+                    {
                         format!("[From user]\n{content}")
-                    } else { content };
+                    } else {
+                        content
+                    };
                     turns.push(PromptTurn::new(PromptTurnKind::USER, content));
                 }
-                "summary" => turns.push(PromptTurn::new(PromptTurnKind::SUMMARY, message.displayText())),
+                "summary" => turns.push(PromptTurn::new(
+                    PromptTurnKind::SUMMARY,
+                    message.displayText(),
+                )),
                 _ => {}
             }
         }
         Ok(turns)
     }
 
+    /// Folds complete older participant turns without splitting provider tool pairs.
+    fn foldedMiddleTurns(
+        messages: &[ChatMessage],
+        configuration: &ChatConfigurationResult,
+    ) -> Vec<Option<String>> {
+        let mut overlay = vec![None; messages.len()];
+        let userIndices = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.sender == "user")
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let foldEnd = userIndices.len().saturating_sub(SUMMARY_TAIL_USER_TURNS);
+        for (round, (start, end)) in userIndices
+            .iter()
+            .copied()
+            .zip(
+                userIndices
+                    .iter()
+                    .skip(1)
+                    .copied()
+                    .chain(std::iter::once(messages.len())),
+            )
+            .take(foldEnd)
+            .enumerate()
+        {
+            let group = &messages[start..end];
+            let assistants = group
+                .iter()
+                .filter(|message| message.sender == "ai")
+                .collect::<Vec<_>>();
+            if assistants.is_empty()
+                || assistants.iter().any(|message| {
+                    configuration.historyPolicy.isolateParticipants
+                        && !message
+                            .pluginExtensions
+                            .get(&configuration.extensionOwner)
+                            .and_then(|identity| identity.get("participantId"))
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|id| id == configuration.profile.id)
+                })
+            {
+                continue;
+            }
+            let mut tools = Vec::new();
+            let mut paths = Vec::new();
+            let mut hashes = std::collections::BTreeSet::new();
+            let mut conclusion = None;
+            for message in assistants {
+                for part in MessagePartCodec::orderedParts(&message.parts) {
+                    match part.kind {
+                        MessagePartKind::ToolCall => {
+                            tools.push(part.toolName.clone().unwrap_or_else(|| "unknown".into()));
+                            for value in part.attributes.values() {
+                                for token in value.split_whitespace() {
+                                    let token = token.trim_matches(|character: char| {
+                                        character.is_ascii_punctuation()
+                                            && character != '/'
+                                            && character != '\\'
+                                            && character != '_'
+                                            && character != '-'
+                                            && character != '.'
+                                    });
+                                    if (token.contains('/') || token.contains('\\'))
+                                        && !token.contains("://")
+                                    {
+                                        paths.push(token.to_string());
+                                    }
+                                }
+                            }
+                        }
+                        MessagePartKind::ToolResult => {
+                            if let Some(hash) = part
+                                .attributes
+                                .get("blob_hash")
+                                .filter(|hash| is_tool_result_blob_hash(hash))
+                            {
+                                hashes.insert(hash.clone());
+                            }
+                        }
+                        MessagePartKind::Markdown => {
+                            if let Some(line) = part
+                                .content
+                                .lines()
+                                .map(str::trim)
+                                .find(|line| !line.is_empty())
+                            {
+                                conclusion = Some(first_sentence(line));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let tools = tools.into_iter().take(16).collect::<Vec<_>>().join(" → ");
+            paths.sort();
+            paths.dedup();
+            let paths = paths.into_iter().take(12).collect::<Vec<_>>().join(", ");
+            let hashes = hashes.into_iter().take(20).collect::<Vec<_>>().join(",");
+            let intent = first_sentence(&group[0].displayText());
+            let conclusion = conclusion.unwrap_or_else(|| "无".into());
+            let mut folded = format!(
+                "[轮{}] 用户意图：{} | 工具：{} | 路径：{} | 结论：{}",
+                round + 1,
+                condense_head_tail(&single_line(&intent), 240, 0),
+                condense_head_tail(&single_line(&tools), 240, 0),
+                condense_head_tail(&single_line(&paths), 400, 0),
+                condense_head_tail(&single_line(&conclusion), 240, 0),
+            );
+            if !hashes.is_empty() {
+                folded.push_str(&format!(" | blob_hash={hashes}"));
+            }
+            overlay[start] = Some(folded);
+            for index in start + 1..end {
+                if messages[index].sender == "ai" {
+                    overlay[index] = Some(String::new());
+                }
+            }
+        }
+        overlay
+    }
+
     /// Converts stored assistant parts into provider turns while preserving tool boundaries.
     #[allow(non_snake_case)]
-    fn assistantPromptTurnsFromParts(message: &ChatMessage) -> Vec<PromptTurn> {
+    fn assistantPromptTurnsFromParts(
+        message: &ChatMessage,
+        toolResultInlineLimit: Option<usize>,
+    ) -> Vec<PromptTurn> {
         let mut turns = Vec::new();
         let mut assistantMarkup = String::new();
         for part in MessagePartCodec::orderedParts(&message.parts) {
             match part.kind {
                 MessagePartKind::Markdown | MessagePartKind::Thinking | MessagePartKind::Status => {
-                    assistantMarkup.push_str(&Self::assistantMarkupForPart(part));
+                    assistantMarkup
+                        .push_str(&Self::assistantMarkupForPart(part, toolResultInlineLimit));
                 }
                 MessagePartKind::ToolCall => {
                     if !assistantMarkup.trim().is_empty() {
@@ -731,7 +1033,7 @@ impl AIMessageManager {
                     }
                     turns.push(PromptTurn {
                         kind: PromptTurnKind::TOOL_CALL,
-                        content: Self::assistantMarkupForPart(part),
+                        content: Self::assistantMarkupForPart(part, toolResultInlineLimit),
                         tool_name: part.toolName.clone(),
                         metadata: HashMap::new(),
                     });
@@ -746,7 +1048,7 @@ impl AIMessageManager {
                     }
                     turns.push(PromptTurn {
                         kind: PromptTurnKind::TOOL_RESULT,
-                        content: Self::assistantMarkupForPart(part),
+                        content: Self::assistantMarkupForPart(part, toolResultInlineLimit),
                         tool_name: part.toolName.clone(),
                         metadata: HashMap::new(),
                     });
@@ -764,8 +1066,8 @@ impl AIMessageManager {
 
     /// Serializes one assistant message part into provider protocol markup.
     #[allow(non_snake_case)]
-    fn assistantMarkupForPart(part: &MessagePart) -> String {
-        MessagePartCodec::assistantMarkup(&[part.clone()])
+    fn assistantMarkupForPart(part: &MessagePart, toolResultInlineLimit: Option<usize>) -> String {
+        MessagePartCodec::assistantMarkupWithToolResultLimit(&[part.clone()], toolResultInlineLimit)
     }
 
     /// Builds display-only reply markup without selecting an execution identity.
@@ -819,10 +1121,25 @@ impl AIMessageManager {
         // that exact shared path locally before considering its original host path.
         let replica = filesystem.and_then(|files| {
             let path = attachment.fileToolPath();
-            if !["/operitapp/outputs/", "/operitapp/workspaces/", "/operitapp/data/data/chat_attachments/", "/app/workspaces/", "/app/outputs/", "/app/data/data/chat_attachments/"].iter().any(|root| path.starts_with(root)) { return None; }
+            if ![
+                "/operitapp/outputs/",
+                "/operitapp/workspaces/",
+                "/operitapp/data/data/chat_attachments/",
+                "/app/workspaces/",
+                "/app/outputs/",
+                "/app/data/data/chat_attachments/",
+            ]
+            .iter()
+            .any(|root| path.starts_with(root))
+            {
+                return None;
+            }
             let found = files.fileExists(&path).ok()?;
-            if !found.exists || found.isDirectory || found.size != attachment.fileSize { return None; }
-            let mut local = attachment.clone(); local.filePath = path;
+            if !found.exists || found.isDirectory || found.size != attachment.fileSize {
+                return None;
+            }
+            let mut local = attachment.clone();
+            local.filePath = path;
             Some(local)
         });
         let attachment = replica.as_ref().unwrap_or(attachment);
@@ -908,7 +1225,8 @@ impl AIMessageManager {
             return Err("VFS is required for direct image attachment".to_string());
         };
         let source = filesystem.fileResource(None, &attachment.filePath)?;
-        let bytes = operit_host_api::FileSource::readBytes(&source).map_err(|error| error.message)?;
+        let bytes =
+            operit_host_api::FileSource::readBytes(&source).map_err(|error| error.message)?;
         if bytes.is_empty() {
             return Err(format!(
                 "image attachment is empty: {}",
@@ -950,12 +1268,11 @@ impl AIMessageManager {
         mediaType: &str,
     ) -> Result<String, String> {
         let Some(filesystem) = filesystem else {
-            return Err(format!(
-                "VFS is required for direct {mediaType} attachment"
-            ));
+            return Err(format!("VFS is required for direct {mediaType} attachment"));
         };
         let source = filesystem.fileResource(None, &attachment.filePath)?;
-        let bytes = operit_host_api::FileSource::readBytes(&source).map_err(|error| error.message)?;
+        let bytes =
+            operit_host_api::FileSource::readBytes(&source).map_err(|error| error.message)?;
         if bytes.is_empty() {
             return Err(format!(
                 "{mediaType} attachment is empty: {}",
@@ -996,7 +1313,10 @@ impl AIMessageManager {
         {
             attributes.push_str(&format!(" node_id=\"{}\"", escape(nodeId)));
         }
-        if ["/app/", "/operitapp/", "/mnt/", "/virtual/"].iter().any(|root| toolPath.starts_with(root)) {
+        if ["/app/", "/operitapp/", "/mnt/", "/virtual/"]
+            .iter()
+            .any(|root| toolPath.starts_with(root))
+        {
             attributes.push_str(&format!(" path=\"{}\"", escape(&toolPath)));
         }
         if attachment.fileSize > 0 {
@@ -1111,7 +1431,10 @@ impl AIMessageManager {
     }
 
     /// Takes ownership of the service before anything can close the response stream.
-    async fn cancelOperationForId(chatKey: &str, expectedOperationId: Option<u64>) -> Result<(), AiServiceError> {
+    async fn cancelOperationForId(
+        chatKey: &str,
+        expectedOperationId: Option<u64>,
+    ) -> Result<(), AiServiceError> {
         let operation = {
             let mut operations = activeChatOperations()
                 .lock()
@@ -1168,7 +1491,9 @@ impl AIMessageManager {
                 errors.push(format!("{chatKey}: {error}"));
             }
         }
-        if errors.is_empty() { Ok(()) } else {
+        if errors.is_empty() {
+            Ok(())
+        } else {
             Err(AiServiceError::RequestFailed(errors.join("; ")))
         }
     }
@@ -1249,10 +1574,72 @@ fn appendConversationReview(summary: &mut String, entries: &[(String, String)], 
     appendEntries(summary, &entries[entries.len() - tailCount..]);
 }
 
+/// Keeps peer speech in shared summaries but never exposes another participant's tools or blob pointers.
+fn summaryMessageForParticipant(
+    message: &ChatMessage,
+    configuration: &ChatConfigurationResult,
+) -> ChatMessage {
+    let isPeer = message.sender == "ai"
+        && configuration.historyPolicy.isolateParticipants
+        && message
+            .pluginExtensions
+            .get(&configuration.extensionOwner)
+            .and_then(|identity| identity.get("participantId"))
+            .and_then(serde_json::Value::as_str)
+            != Some(configuration.profile.id.as_str());
+    if !isPeer {
+        return message.clone();
+    }
+    let mut filtered = message.clone();
+    filtered
+        .parts
+        .retain(|part| part.kind == MessagePartKind::Markdown);
+    filtered
+}
+
+/// Selects only complete older turns for automatic summaries, leaving the latest user turns verbatim.
+fn summarySourceMessages(
+    messages: &[ChatMessage],
+    lastSummaryIndex: Option<usize>,
+    preserveRecentTurns: bool,
+) -> Vec<ChatMessage> {
+    let start = lastSummaryIndex.map_or(0, |index| index + 1);
+    let end = if preserveRecentTurns {
+        let Some(insertPosition) =
+            AIMessageManager::summaryInsertPosition(messages, lastSummaryIndex, true)
+        else {
+            return Vec::new();
+        };
+        insertPosition
+    } else {
+        messages.len()
+    };
+    messages[start..end]
+        .iter()
+        .filter(|message| message.sender == "user" || message.sender == "ai")
+        .cloned()
+        .collect()
+}
+
+/// Removes the appended review before its text is inherited by the next checkpoint.
+fn removePreviousConversationReview(summary: &str) -> String {
+    ["【对话回顾】", "【Conversation Review】"]
+        .iter()
+        .filter_map(|marker| summary.find(marker))
+        .min()
+        .map_or_else(
+            || summary.trim().to_string(),
+            |start| summary[..start].trim_end().to_string(),
+        )
+}
+
 #[allow(non_snake_case)]
-fn cleanSummarySourceMessage(message: &ChatMessage) -> String {
+fn cleanSummarySourceMessage(
+    message: &ChatMessage,
+    toolResultInlineLimit: Option<usize>,
+) -> String {
     let source = if message.sender == "ai" {
-        message.assistantProtocolMarkup()
+        MessagePartCodec::assistantMarkupWithToolResultLimit(&message.parts, toolResultInlineLimit)
     } else {
         message.displayText()
     };
@@ -1297,10 +1684,8 @@ fn condenseAssistantMessageForReview(message: &ChatMessage) -> String {
         let content = ChatMarkupRegex::remove_meta_tags(&part.content);
         let segment = match part.kind {
             MessagePartKind::Markdown | MessagePartKind::Status => {
-                let cleaned = strip_xml_tags(&strip_media_links(&strip_tag_blocks(
-                    &content,
-                    "memory",
-                )));
+                let cleaned =
+                    strip_xml_tags(&strip_media_links(&strip_tag_blocks(&content, "memory")));
                 let condensed = condense_head_tail(&cleaned, 120, 48);
                 (!condensed.trim().is_empty()).then_some(condensed)
             }
@@ -1358,7 +1743,14 @@ fn condenseAssistantMessageForReview(message: &ChatMessage) -> String {
                 } else {
                     format!(" {result}")
                 };
-                Some(format!("[{tool_label}{status_text}]{result_text}"))
+                let hash = part
+                    .attributes
+                    .get("blob_hash")
+                    .and_then(|hash| is_tool_result_blob_hash(hash).then_some(hash.as_str()));
+                let hash_text = hash.map_or_else(String::new, |hash| format!(" blob_hash={hash}"));
+                Some(format!(
+                    "[{tool_label}{status_text}]{result_text}{hash_text}"
+                ))
             }
         };
         if let Some(segment) = segment {
@@ -1377,6 +1769,22 @@ fn condenseAssistantMessageForReview(message: &ChatMessage) -> String {
         segments = bounded;
     }
     segments.join(" ").trim().to_string()
+}
+
+fn single_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn first_sentence(text: &str) -> String {
+    let trimmed = text.trim();
+    let end = trimmed
+        .char_indices()
+        .find_map(|(index, character)| {
+            matches!(character, '。' | '！' | '？' | '!' | '?' | '\n')
+                .then(|| index + character.len_utf8())
+        })
+        .unwrap_or(trimmed.len());
+    trimmed[..end].trim().to_string()
 }
 
 fn condense_head_tail(text: &str, head_chars: usize, tail_chars: usize) -> String {
@@ -1486,12 +1894,220 @@ mod tests {
     /// Low context usage cannot trigger automatic summaries, even after many user turns.
     #[test]
     fn automatic_summary_requires_context_token_threshold() {
-        assert!(!AIMessageManager::shouldGenerateSummary(4_000, 200_000, 0.85, true));
-        assert!(!AIMessageManager::shouldGenerateSummary(169_999, 200_000, 0.85, true));
-        assert!(AIMessageManager::shouldGenerateSummary(170_000, 200_000, 0.85, true));
-        assert!(AIMessageManager::shouldGenerateSummary(200_000, 200_000, 0.85, true));
-        assert!(!AIMessageManager::shouldGenerateSummary(200_000, 200_000, 0.85, false));
-        assert!(!AIMessageManager::shouldGenerateSummary(4_000, 0, 0.85, true));
+        assert!(!AIMessageManager::shouldGenerateSummary(
+            4_000, 200_000, 0.85, true
+        ));
+        assert!(!AIMessageManager::shouldGenerateSummary(
+            169_999, 200_000, 0.85, true
+        ));
+        assert!(AIMessageManager::shouldGenerateSummary(
+            170_000, 200_000, 0.85, true
+        ));
+        assert!(AIMessageManager::shouldGenerateSummary(
+            200_000, 200_000, 0.85, true
+        ));
+        assert!(AIMessageManager::shouldGenerateSummary(
+            170_000,
+            200_000,
+            f64::from(0.85_f32),
+            true
+        ));
+        assert!(!AIMessageManager::shouldGenerateSummary(
+            200_000, 200_000, 0.85, false
+        ));
+        assert!(!AIMessageManager::shouldGenerateSummary(
+            4_000, 0, 0.85, true
+        ));
+    }
+
+    #[test]
+    fn automatic_summary_keeps_four_recent_user_turns_verbatim() {
+        let mut messages = vec![ChatMessage::new_with_markdown(
+            "summary".into(),
+            "old".into(),
+        )];
+        for index in 0..5 {
+            messages.push(ChatMessage::new_with_markdown(
+                "user".into(),
+                format!("user-{index}"),
+            ));
+            messages.push(ChatMessage::new_with_markdown(
+                "ai".into(),
+                format!("ai-{index}"),
+            ));
+        }
+        let selected = summarySourceMessages(&messages, Some(0), true);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|message| message.displayText())
+                .collect::<Vec<_>>(),
+            vec!["user-0", "ai-0"]
+        );
+        assert_eq!(
+            summarySourceMessages(&messages[..9], Some(0), true).len(),
+            0
+        );
+        assert_eq!(summarySourceMessages(&messages, Some(0), false).len(), 10);
+        assert_eq!(
+            AIMessageManager::summaryInsertPosition(&messages, Some(0), true),
+            Some(3)
+        );
+        assert_eq!(
+            AIMessageManager::summaryInsertPosition(&messages[..9], Some(0), true),
+            None
+        );
+        assert_eq!(
+            AIMessageManager::summaryInsertPosition(&messages, Some(0), false),
+            Some(messages.len())
+        );
+
+        let mut checkpointed = messages[..9].to_vec();
+        checkpointed.push(ChatMessage::new_with_markdown(
+            "summary".into(),
+            "new".into(),
+        ));
+        checkpointed.extend_from_slice(&messages[9..]);
+        let turns = AIMessageManager::getMemoryFromMessages(
+            checkpointed,
+            &historyConfiguration(false, false),
+        )
+        .unwrap();
+        assert!(turns.iter().any(|turn| turn.content == "user-4"));
+        assert!(turns.iter().any(|turn| turn.content == "ai-4"));
+        let mut wholeHistoryCheckpoint = messages.clone();
+        wholeHistoryCheckpoint.push(ChatMessage::new_with_markdown(
+            "summary".into(),
+            "all".into(),
+        ));
+        let compactedTurns = AIMessageManager::getMemoryFromMessages(
+            wholeHistoryCheckpoint,
+            &historyConfiguration(false, false),
+        )
+        .unwrap();
+        assert_eq!(compactedTurns.len(), 1);
+        assert_eq!(compactedTurns[0].content, "all");
+
+        let mut accounting = vec![ChatMessage::new_with_markdown_timestamp(
+            "summary".into(),
+            "checkpoint".into(),
+            50,
+        )];
+        AIMessageManager::markSummaryAccountingBaseline(&mut accounting[0], Some(90), &[]);
+        for (timestamp, sender) in [(60, "user"), (70, "ai"), (80, "user"), (90, "ai")] {
+            accounting.push(ChatMessage::new_with_markdown_timestamp(
+                sender.into(),
+                format!("retained-{timestamp}"),
+                timestamp,
+            ));
+        }
+        assert_eq!(
+            AIMessageManager::summaryAccountingStart(&accounting, Some(0)),
+            5
+        );
+        accounting.push(ChatMessage::new_with_markdown_timestamp(
+            "user".into(),
+            "new".into(),
+            100,
+        ));
+        assert_eq!(
+            AIMessageManager::summaryAccountingStart(&accounting, Some(0)),
+            5
+        );
+        accounting.push(ChatMessage::new_with_markdown_timestamp(
+            "ai".into(),
+            "reply".into(),
+            110,
+        ));
+        assert_eq!(
+            AIMessageManager::summaryAccountingStart(&accounting, Some(0)),
+            5
+        );
+
+        let retained = accounting[1..5].to_vec();
+        let mut variantHistory = vec![ChatMessage::new_with_markdown_timestamp(
+            "summary".into(),
+            "checkpoint".into(),
+            50,
+        )];
+        AIMessageManager::markSummaryAccountingBaseline(
+            &mut variantHistory[0],
+            Some(90),
+            &retained,
+        );
+        variantHistory.extend(retained);
+        assert_eq!(
+            AIMessageManager::summaryAccountingStart(&variantHistory, Some(0)),
+            5
+        );
+        variantHistory[2].selectedVariantIndex = 1;
+        variantHistory[2].variantCount = 2;
+        assert_eq!(
+            AIMessageManager::summaryAccountingStart(&variantHistory, Some(0)),
+            2
+        );
+
+        accounting[0].pluginExtensions.clear();
+        assert_eq!(
+            AIMessageManager::summaryAccountingStart(&accounting, Some(0)),
+            1
+        );
+    }
+
+    #[test]
+    fn previous_review_is_not_inherited_and_tool_results_keep_their_blob_pointer() {
+        let summary = "正文\n\n【对话回顾】\n- user: 旧回顾";
+        assert_eq!(removePreviousConversationReview(summary), "正文");
+        let summary = "Body\n\n【Conversation Review】\n- user: old review";
+        assert_eq!(removePreviousConversationReview(summary), "Body");
+        let hash = "a".repeat(64);
+        let mut result = MessagePart::toolResult(
+            "result".into(),
+            0,
+            Some("call".into()),
+            "read_file".into(),
+            "success".into(),
+            "x".repeat(5000),
+        );
+        result.attributes.insert("blob_hash".into(), hash.clone());
+        let message = ChatMessage::new_with_parts("ai".into(), vec![result]);
+        let source = cleanSummarySourceMessage(&message, Some(4000));
+        assert!(source.contains("外置 5000 字符"));
+        assert!(source.contains(&format!("hash={hash}")));
+        assert!(!source.contains(&"x".repeat(5000)));
+        assert!(condenseAssistantMessageForReview(&message).contains(&format!("blob_hash={hash}")));
+    }
+
+    #[test]
+    fn shared_summary_excludes_peer_tool_results_and_blob_pointers() {
+        let hash = "c".repeat(64);
+        let mut result = MessagePart::toolResult(
+            "result".into(),
+            1,
+            Some("call".into()),
+            "peer_read".into(),
+            "success".into(),
+            "peer secret".into(),
+        );
+        result.attributes.insert("blob_hash".into(), hash);
+        let mut peer = ChatMessage::new_with_parts(
+            "ai".into(),
+            vec![
+                MessagePart::markdown("speech".into(), 0, "peer conclusion".into()),
+                result,
+            ],
+        );
+        peer.pluginExtensions.insert(
+            "configuration-owner".into(),
+            serde_json::json!({"participantId":"peer-id"}),
+        );
+        let configuration = historyConfiguration(true, false);
+        let filtered = summaryMessageForParticipant(&peer, &configuration);
+        let source = cleanSummarySourceMessage(&filtered, Some(4000));
+        assert!(source.contains("peer conclusion"));
+        assert!(!source.contains("peer_read"));
+        assert!(!source.contains("peer secret"));
+        assert!(!source.contains(&"c".repeat(64)));
     }
 
     /// Constructs an explicit descriptor for real history projection tests without a host runtime.
@@ -1513,8 +2129,14 @@ mod tests {
     /// Builds exact persisted authors independently of the current participant roster or display names.
     fn authoredHistory(id: &str, title: &str, parts: Vec<MessagePart>) -> ChatMessage {
         let mut message = ChatMessage::new_with_parts("ai".into(), parts);
-        message.pluginExtensions.insert("configuration-owner".into(), serde_json::json!({"participantId":id}));
-        message.pluginExtensions.insert("host.chat.identity".into(), serde_json::json!({"title":title,"avatarUri":null}));
+        message.pluginExtensions.insert(
+            "configuration-owner".into(),
+            serde_json::json!({"participantId":id}),
+        );
+        message.pluginExtensions.insert(
+            "host.chat.identity".into(),
+            serde_json::json!({"title":title,"avatarUri":null}),
+        );
         message
     }
 
@@ -1522,25 +2144,63 @@ mod tests {
     #[test]
     fn participant_history_uses_ids_across_rename_and_removed_members() {
         let configuration = historyConfiguration(true, true);
-        let own = authoredHistory("author-id", "Old name", vec![MessagePart::markdown("own".into(), 0, "My old reply".into())]);
-        let peer = authoredHistory("removed-peer", "Display name", vec![MessagePart::markdown("peer".into(), 0, "Another participant".into())]);
-        let turns = AIMessageManager::getMemoryFromMessages(vec![own, peer], &configuration).unwrap();
+        let own = authoredHistory(
+            "author-id",
+            "Old name",
+            vec![MessagePart::markdown(
+                "own".into(),
+                0,
+                "My old reply".into(),
+            )],
+        );
+        let peer = authoredHistory(
+            "removed-peer",
+            "Display name",
+            vec![MessagePart::markdown(
+                "peer".into(),
+                0,
+                "Another participant".into(),
+            )],
+        );
+        let turns =
+            AIMessageManager::getMemoryFromMessages(vec![own, peer], &configuration).unwrap();
         assert_eq!(turns[0].kind, PromptTurnKind::ASSISTANT);
         assert_eq!(turns[0].content, "My old reply");
         assert_eq!(turns[1].kind, PromptTurnKind::USER);
-        assert_eq!(turns[1].content, "[From role: Display name]\nAnother participant");
+        assert_eq!(
+            turns[1].content,
+            "[From role: Display name]\nAnother participant"
+        );
     }
 
     /// Excludes a peer's private thinking, status and tool protocol from another participant's reference text.
     #[test]
     fn participant_history_exposes_only_other_participants_speech() {
-        let peer = authoredHistory("peer", "Peer", vec![
-            MessagePart::thinking("thinking".into(), 0, "Private reasoning".into()),
-            MessagePart::markdown("speech".into(), 1, "Public reply".into()),
-            MessagePart::toolResult("tool".into(), 2, Some("call".into()), "read".into(), "success".into(), "Private tool output".into()),
-            MessagePart::status("status".into(), 3, "Internal status".into(), BTreeMap::new()),
-        ]);
-        let turns = AIMessageManager::getMemoryFromMessages(vec![peer], &historyConfiguration(true, true)).unwrap();
+        let peer = authoredHistory(
+            "peer",
+            "Peer",
+            vec![
+                MessagePart::thinking("thinking".into(), 0, "Private reasoning".into()),
+                MessagePart::markdown("speech".into(), 1, "Public reply".into()),
+                MessagePart::toolResult(
+                    "tool".into(),
+                    2,
+                    Some("call".into()),
+                    "read".into(),
+                    "success".into(),
+                    "Private tool output".into(),
+                ),
+                MessagePart::status(
+                    "status".into(),
+                    3,
+                    "Internal status".into(),
+                    BTreeMap::new(),
+                ),
+            ],
+        );
+        let turns =
+            AIMessageManager::getMemoryFromMessages(vec![peer], &historyConfiguration(true, true))
+                .unwrap();
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].content, "[From role: Peer]\nPublic reply");
     }
@@ -1549,12 +2209,26 @@ mod tests {
     #[test]
     fn participant_history_labels_users_and_respects_summary_boundaries() {
         let invalidOld = ChatMessage::new("ai".into());
-        let summary = ChatMessage::new_with_parts("summary".into(), vec![MessagePart::markdown("summary".into(), 0, "Summary".into())]);
-        let user = ChatMessage::new_with_parts("user".into(), vec![MessagePart::markdown("user".into(), 0, "Question".into())]);
-        let turns = AIMessageManager::getMemoryFromMessages(vec![invalidOld, summary, user.clone()], &historyConfiguration(true, true)).unwrap();
+        let summary = ChatMessage::new_with_parts(
+            "summary".into(),
+            vec![MessagePart::markdown("summary".into(), 0, "Summary".into())],
+        );
+        let user = ChatMessage::new_with_parts(
+            "user".into(),
+            vec![MessagePart::markdown("user".into(), 0, "Question".into())],
+        );
+        let turns = AIMessageManager::getMemoryFromMessages(
+            vec![invalidOld, summary, user.clone()],
+            &historyConfiguration(true, true),
+        )
+        .unwrap();
         assert_eq!(turns[0].kind, PromptTurnKind::SUMMARY);
         assert_eq!(turns[1].content, "[From user]\nQuestion");
-        let ordinary = AIMessageManager::getMemoryFromMessages(vec![user], &historyConfiguration(false, false)).unwrap();
+        let ordinary = AIMessageManager::getMemoryFromMessages(
+            vec![user],
+            &historyConfiguration(false, false),
+        )
+        .unwrap();
         assert_eq!(ordinary[0].content, "Question");
     }
 
@@ -1562,8 +2236,16 @@ mod tests {
     #[test]
     fn participant_history_requires_persisted_author_identity() {
         let configuration = historyConfiguration(true, true);
-        assert!(AIMessageManager::getMemoryFromMessages(vec![ChatMessage::new("ai".into())], &configuration).is_err());
-        let mut peer = authoredHistory("peer", "Peer", vec![MessagePart::markdown("peer".into(), 0, "Reply".into())]);
+        assert!(AIMessageManager::getMemoryFromMessages(
+            vec![ChatMessage::new("ai".into())],
+            &configuration
+        )
+        .is_err());
+        let mut peer = authoredHistory(
+            "peer",
+            "Peer",
+            vec![MessagePart::markdown("peer".into(), 0, "Reply".into())],
+        );
         peer.pluginExtensions.remove("host.chat.identity");
         assert!(AIMessageManager::getMemoryFromMessages(vec![peer], &configuration).is_err());
     }
@@ -1583,8 +2265,10 @@ mod tests {
         configuration.extensionOwner = "configuration-owner".into();
         for sender in ["ai", "user"] {
             let mut message = ChatMessage::new(sender.into());
-            message.pluginExtensions.insert("host.chat.identity".into(),
-                serde_json::json!({"title":"Operit","avatarUri":null}));
+            message.pluginExtensions.insert(
+                "host.chat.identity".into(),
+                serde_json::json!({"title":"Operit","avatarUri":null}),
+            );
             AIMessageManager::applyConfigurationIdentity(&mut message, &configuration);
             let mut expected = serde_json::json!({
                 "configuration-owner":{"participantId":"author-id"}
@@ -1594,7 +2278,10 @@ mod tests {
                     "title":"Display name","avatarUri":null
                 });
             }
-            assert_eq!(serde_json::to_value(&message.pluginExtensions).unwrap(), expected);
+            assert_eq!(
+                serde_json::to_value(&message.pluginExtensions).unwrap(),
+                expected
+            );
         }
     }
 
@@ -1607,11 +2294,14 @@ mod tests {
             3,
         );
         attachment.nodeId = Some("core-b".into());
-        attachment.vfsPath = Some("/operitapp/outputs/family/.operit/attachments/id/report.pdf".into());
+        attachment.vfsPath =
+            Some("/operitapp/outputs/family/.operit/attachments/id/report.pdf".into());
         let tag =
             AIMessageManager::buildAttachmentTag(&attachment, None, false, false, false).unwrap();
         assert!(tag.contains("node_id=\"core-b\""));
-        assert!(tag.contains("path=\"/operitapp/outputs/family/.operit/attachments/id/report.pdf\""));
+        assert!(
+            tag.contains("path=\"/operitapp/outputs/family/.operit/attachments/id/report.pdf\"")
+        );
         assert!(tag.contains("filename=\"报价单&quot;.pdf\""));
         assert!(tag.contains("id=\"/operitapp/outputs/family/.operit/attachments/id/report.pdf\""));
         assert!(!tag.contains("/device-b/"));
@@ -1639,10 +2329,14 @@ mod tests {
     #[test]
     fn inline_attachment_markup_keeps_its_content_identifier() {
         let mut attachment = AttachmentInfo::new(
-            "pasted_text_1".into(), "pasted_text.txt".into(), "text/plain".into(), 3,
+            "pasted_text_1".into(),
+            "pasted_text.txt".into(),
+            "text/plain".into(),
+            3,
         );
         attachment.content = "text".into();
-        let tag = AIMessageManager::buildAttachmentTag(&attachment, None, false, false, false).unwrap();
+        let tag =
+            AIMessageManager::buildAttachmentTag(&attachment, None, false, false, false).unwrap();
         assert!(tag.contains("id=\"pasted_text_1\""));
         assert!(!tag.contains(" path="));
         assert!(!tag.contains("node_id="));
@@ -1726,7 +2420,11 @@ mod tests {
             ],
         );
 
-        let turns = AIMessageManager::getMemoryFromMessages(vec![message], &historyConfiguration(false, false)).unwrap();
+        let turns = AIMessageManager::getMemoryFromMessages(
+            vec![message],
+            &historyConfiguration(false, false),
+        )
+        .unwrap();
 
         assert_eq!(
             turns
@@ -1748,6 +2446,116 @@ mod tests {
             .starts_with("<tool_result name=\"switch_core\""));
         assert_eq!(turns[2].tool_name.as_deref(), Some("switch_core"));
         assert_eq!(turns[3].content, "after");
+    }
+
+    #[test]
+    fn middle_turn_folding_keeps_tool_pairs_and_the_recent_window_intact() {
+        let hash = "b".repeat(64);
+        let mut messages = vec![ChatMessage::new_with_markdown(
+            "summary".into(),
+            "checkpoint".into(),
+        )];
+        for index in 0..6 {
+            messages.push(ChatMessage::new_with_markdown(
+                "user".into(),
+                format!("修复第{index}个问题。继续细节"),
+            ));
+            let mut result = MessagePart::toolResult(
+                format!("result-{index}"),
+                2,
+                Some(format!("call-{index}")),
+                "read_file".into(),
+                "success".into(),
+                format!("result-{index}"),
+            );
+            result.attributes.insert("blob_hash".into(), hash.clone());
+            messages.push(ChatMessage::new_with_parts(
+                "ai".into(),
+                vec![
+                    MessagePart::markdown("before".into(), 0, "开始处理".into()),
+                    MessagePart::toolCall(
+                        format!("call-{index}"),
+                        1,
+                        format!("call-{index}"),
+                        "read_file".into(),
+                        BTreeMap::from([("path".into(), format!("src/file-{index}.rs"))]),
+                    ),
+                    result,
+                    MessagePart::markdown(
+                        "after".into(),
+                        3,
+                        format!("第{index}项已完成。后续说明").into(),
+                    ),
+                ],
+            ));
+        }
+        let mut configuration = historyConfiguration(false, false);
+        configuration.foldMiddleTurns = true;
+        let turns =
+            AIMessageManager::getMemoryFromMessages(messages.clone(), &configuration).unwrap();
+        assert_eq!(turns[0].kind, PromptTurnKind::SUMMARY);
+        assert!(turns[1]
+            .content
+            .starts_with("[轮1] 用户意图：修复第0个问题。"));
+        assert!(turns[1].content.contains("工具：read_file"));
+        assert!(turns[1].content.contains("src/file-0.rs"));
+        assert!(turns[1].content.contains("结论：第0项已完成。"));
+        assert!(turns[1].content.contains(&format!("blob_hash={hash}")));
+        assert!(turns[2].content.starts_with("[轮2]"));
+        assert_eq!(
+            turns
+                .iter()
+                .filter(|turn| turn.kind == PromptTurnKind::TOOL_CALL)
+                .count(),
+            4
+        );
+        assert_eq!(
+            turns
+                .iter()
+                .filter(|turn| turn.kind == PromptTurnKind::TOOL_RESULT)
+                .count(),
+            4
+        );
+        assert!(turns
+            .iter()
+            .any(|turn| turn.content == "修复第5个问题。继续细节"));
+        assert_eq!(
+            AIMessageManager::foldedMiddleTurns(&messages, &configuration),
+            AIMessageManager::foldedMiddleTurns(&messages, &configuration)
+        );
+
+        configuration.foldMiddleTurns = false;
+        let unfolded =
+            AIMessageManager::getMemoryFromMessages(messages.clone(), &configuration).unwrap();
+        assert_eq!(
+            unfolded
+                .iter()
+                .filter(|turn| turn.kind == PromptTurnKind::TOOL_CALL)
+                .count(),
+            6
+        );
+        assert!(!unfolded.iter().any(|turn| turn.content.starts_with("[轮")));
+
+        let mut isolated = historyConfiguration(true, false);
+        isolated.foldMiddleTurns = true;
+        let mut peerMessages = messages;
+        for message in &mut peerMessages {
+            if message.sender == "ai" {
+                message.pluginExtensions.insert(
+                    isolated.extensionOwner.clone(),
+                    serde_json::json!({"participantId":"peer"}),
+                );
+                message.pluginExtensions.insert(
+                    "host.chat.identity".into(),
+                    serde_json::json!({"title":"Peer"}),
+                );
+            }
+        }
+        let peerTurns = AIMessageManager::getMemoryFromMessages(peerMessages, &isolated).unwrap();
+        assert!(!peerTurns.iter().any(|turn| turn.content.starts_with("[轮")));
+        assert!(!peerTurns
+            .iter()
+            .any(|turn| turn.content.contains("src/file-0.rs")));
     }
 
     /// Enforces a fixed review size even for chats with thousands of messages.
@@ -1807,8 +2615,8 @@ mod tests {
         let text = format!("前文<meta provider=\"openai:reasoning\">{payload}</meta>后文");
         let assistant = ChatMessage::new_with_markdown("ai".to_string(), text.clone());
         let user = ChatMessage::new_with_markdown("user".to_string(), text.clone());
-        assert_eq!(cleanSummarySourceMessage(&assistant), "前文 后文");
-        assert_eq!(cleanSummarySourceMessage(&user), "前文 后文");
+        assert_eq!(cleanSummarySourceMessage(&assistant, None), "前文 后文");
+        assert_eq!(cleanSummarySourceMessage(&user, None), "前文 后文");
         assert_eq!(condenseAssistantMessageForReview(&assistant), "前文 后文");
         assert_eq!(condenseUserForReview(&text), "前文 后文");
         assert!(assistant.displayText().contains(&payload));
@@ -1875,7 +2683,9 @@ mod tests {
 
 #[cfg(test)]
 mod cancellation_tests {
-    use super::{AIMessageManager, AttachmentInfo, ChatOperationRegistry, MessageCancellationToken};
+    use super::{
+        AIMessageManager, AttachmentInfo, ChatOperationRegistry, MessageCancellationToken,
+    };
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -1955,13 +2765,19 @@ mod cancellation_tests {
     }
     #[test]
     fn output_attachment_uses_its_saved_vfs_locator_in_ai_metadata() {
-        let mut attachment = AttachmentInfo::new("/device-a/output/report.md".into(), "report.md".into(), "text/markdown".into(), 12);
-        attachment.vfsPath = Some("/operitapp/outputs/family/.operit/attachments/id/report.md".into());
+        let mut attachment = AttachmentInfo::new(
+            "/device-a/output/report.md".into(),
+            "report.md".into(),
+            "text/markdown".into(),
+            12,
+        );
+        attachment.vfsPath =
+            Some("/operitapp/outputs/family/.operit/attachments/id/report.md".into());
         attachment.nodeId = Some("source-node".into());
-        let tag = AIMessageManager::buildAttachmentTag(&attachment, None, false, false, false).unwrap();
+        let tag =
+            AIMessageManager::buildAttachmentTag(&attachment, None, false, false, false).unwrap();
         assert!(tag.contains("path=\"/operitapp/outputs/family/.operit/attachments/id/report.md\""));
         assert!(tag.contains("node_id=\"source-node\""));
         assert!(!tag.contains("/device-a/"));
     }
-
 }

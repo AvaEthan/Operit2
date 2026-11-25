@@ -99,6 +99,19 @@ void main() {
       await tester.tap(find.byIcon(Icons.data_usage_rounded));
       await tester.pumpAndSettle();
       expect(find.text('5826 / 1000000'), findsOneWidget);
+      expect(find.text('缓存命中率'), findsOneWidget);
+      expect(find.text('50%'), findsOneWidget);
+
+      bridge.latestAssistantInputTokens = 0;
+      bridge.cachedInputTokens = 0;
+      await tester.pump(const Duration(seconds: 4));
+      await tester.pumpAndSettle();
+      expect(find.text('--'), findsWidgets);
+
+      bridge.cachedInputTokens = 8972;
+      await tester.pump(const Duration(seconds: 4));
+      await tester.pumpAndSettle();
+      expect(find.text('100%'), findsOneWidget);
 
       bridge.currentWindowSize = 129774;
       await tester.pump(const Duration(seconds: 4));
@@ -312,6 +325,8 @@ class _DeviceStatsBridge extends OperitRuntimeBridge {
   Object? summaryError;
   int topologyCalls = 0;
   int currentWindowSize = 5826;
+  int latestAssistantInputTokens = 4486;
+  int cachedInputTokens = 4486;
 
   BindingRouteStatus get status => BindingRouteStatus(
     ownerNodeId: owner,
@@ -345,6 +360,8 @@ class _DeviceStatsBridge extends OperitRuntimeBridge {
         currentWindowSize: currentWindowSize,
         inputTokenCount: 8972,
         outputTokenCount: 96,
+        cachedInputTokens: cachedInputTokens,
+        latestAssistantInputTokens: latestAssistantInputTokens,
         maxContextLength: 1000,
       ).toJson(),
       'deviceSpaceTopology' => RuntimeDeviceSpaceTopology(

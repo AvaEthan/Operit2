@@ -258,6 +258,8 @@ fn configuration(binding: &FunctionModelBinding) -> ChatConfigurationResult {
         .clone(),
         profile: profile.clone(),
         participants: vec![profile],
+        toolResultInlineLimit: 4000,
+        foldMiddleTurns: false,
         extensionOwner: "host.chat.model".into(),
     }
 }

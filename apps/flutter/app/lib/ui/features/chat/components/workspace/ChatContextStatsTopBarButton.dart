@@ -227,6 +227,16 @@ class _ChatContextStatsTopBarButtonState
     return _summary!.currentWindowSize / limit * 100;
   }
 
+  double? get _cacheHitRate {
+    final summary = _summary;
+    if (summary == null) return null;
+    final totalInput =
+        summary.latestAssistantInputTokens + summary.cachedInputTokens;
+    if (totalInput <= 0) return null;
+    final rate = summary.cachedInputTokens / totalInput;
+    return rate.clamp(0.0, 1.0);
+  }
+
   /// Opens the existing device settings through the menu's only add-device action.
   void _openDeviceSpaceSettings() {
     _menuController.close();
@@ -362,6 +372,12 @@ class _ChatContextStatsTopBarButtonState
                         _StatRow(
                           label: '输出 Token',
                           value: '${_summary!.outputTokenCount}',
+                        ),
+                        _StatRow(
+                          label: '缓存命中率',
+                          value: _cacheHitRate == null
+                              ? '--'
+                              : '${(_cacheHitRate! * 100).toStringAsFixed(0)}%',
                         ),
                       ],
                       const Divider(height: 16),

@@ -68,7 +68,6 @@ use operit_util::MarkdownRenderStream::MarkdownStreamEvent;
 
 const TAG: &str = "EnhancedAIService";
 /// Provider-facing budget per externalized tool result; the transcript keeps the full payload.
-const TOOL_RESULT_INLINE_LIMIT_CHARS: usize = 4_000;
 
 /// Carries the finalized result of one tool or warning round to the next model request.
 struct ToolResultContinuation {
@@ -84,6 +83,12 @@ enum ResponseRoundAction {
     Continue(ToolResultContinuation),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequestWindowEstimate {
+    pub chatId: Option<String>,
+    pub windowSize: i64,
+}
+
 pub struct EnhancedAIService {
     pub multi_service_manager: MultiServiceManager,
     pub init_scope: InitScopeMirror,
@@ -92,7 +97,7 @@ pub struct EnhancedAIService {
     pub file_binding_service: FileBindingServiceMirror,
     pub tool_handler: AIToolHandler,
     pub input_processing_state: MutableStateFlow<InputProcessingState>,
-    pub request_window_estimate_flow: MutableStateFlow<Option<i64>>,
+    pub request_window_estimate_flow: MutableStateFlow<Option<RequestWindowEstimate>>,
     pub api_preferences: ApiPreferencesMirror,
     pub tool_processing_scope: ToolProcessingScopeMirror,
     pub package_manager: PackageManagerMirror,
@@ -105,7 +110,7 @@ pub struct EnhancedAISharedState {
     /// Actual model response rounds in the current main send.
     pub responseRound: i32,
     pub turn_token_usage: TurnTokenUsage,
-    pub request_window_estimate: Option<i64>,
+    pub request_window_estimate: Option<RequestWindowEstimate>,
     pub active_execution_contexts: BTreeMap<i32, MessageExecutionContext>,
     pub next_execution_context_id: i32,
     /// Invalidates sends that are still waiting to register their response task.
@@ -936,10 +941,11 @@ impl EnhancedAIService {
         runtime.modelParameters.clone()
     }
 
-    pub fn publishRequestWindowEstimate(&mut self, windowSize: i64) {
-        self.shared_state().request_window_estimate = Some(windowSize);
+    pub fn publishRequestWindowEstimate(&mut self, chatId: Option<String>, windowSize: i64) {
+        let estimate = RequestWindowEstimate { chatId, windowSize };
+        self.shared_state().request_window_estimate = Some(estimate.clone());
         self.request_window_estimate_flow
-            .set_value(Some(windowSize));
+            .set_value(Some(estimate));
     }
 
     pub async fn estimatePreparedRequestWindow(
@@ -947,6 +953,7 @@ impl EnhancedAIService {
         serviceForFunction: SharedAIServiceHandle,
         preparedHistory: &[PromptTurn],
         availableTools: &[ToolPrompt],
+        chatId: Option<String>,
         publishEstimate: bool,
     ) -> Result<i64, AiServiceError> {
         let windowSize = {
@@ -956,7 +963,7 @@ impl EnhancedAIService {
                 .await?
         };
         if publishEstimate {
-            self.publishRequestWindowEstimate(windowSize);
+            self.publishRequestWindowEstimate(chatId, windowSize);
         }
         Ok(windowSize)
     }
@@ -1354,7 +1361,7 @@ impl EnhancedAIService {
         ));
         let context = PromptHookContext {
             stage: "before_finalize_prompt".into(),
-            chat_id: chatId,
+            chat_id: chatId.clone(),
             function_type: Some(function_type_name(&FunctionType::CHAT).into()),
             prompt_function_type: Some(prompt_function_type_name(&promptFunctionType).into()),
             raw_input: Some(message.clone()),
@@ -1376,6 +1383,7 @@ impl EnhancedAIService {
             serviceForFunction,
             &preparedHistory,
             &availableTools,
+            chatId,
             publishEstimate,
         )
         .await
@@ -1458,7 +1466,7 @@ impl EnhancedAIService {
     }
 
     #[allow(non_snake_case)]
-    pub fn requestWindowEstimateFlow(&self) -> MutableStateFlow<Option<i64>> {
+    pub fn requestWindowEstimateFlow(&self) -> MutableStateFlow<Option<RequestWindowEstimate>> {
         self.request_window_estimate_flow.clone()
     }
 
@@ -1994,6 +2002,7 @@ impl EnhancedAIService {
                 serviceForFunction.clone(),
                 &requestHistory,
                 &availableTools,
+                chatId.clone(),
                 true,
             )
             .await?;
@@ -2286,6 +2295,7 @@ impl EnhancedAIService {
             runtime.aiService.clone(),
             &execContext.conversationHistory,
             &preparedRequest.availableTools,
+            chatId.clone(),
             false,
         ).await {
             Ok(windowSize) => Some(windowSize),
@@ -2301,7 +2311,7 @@ impl EnhancedAIService {
             return Ok(());
         }
         if let Some(windowSize) = completedContextWindow {
-            self.publishRequestWindowEstimate(windowSize);
+            self.publishRequestWindowEstimate(chatId.clone(), windowSize);
         }
         AppLogger::v_with_level(TAG, &format!(
             "completed request window from prepared state chatId={} executionId={} elapsedMs={} success={}",
@@ -2439,7 +2449,7 @@ impl EnhancedAIService {
                     match ConversationMarkupManager::projectToolResultMessageForSend(
                         &turn.content,
                         &blobHashes,
-                        Some(TOOL_RESULT_INLINE_LIMIT_CHARS),
+                        runtime.chatConfiguration.toolResultInlineLimitChars(),
                     ) {
                         Ok(projected) => turn.content = projected,
                         Err(error) => {
@@ -2520,6 +2530,7 @@ impl EnhancedAIService {
                 runtime.aiService.clone(),
                 &currentChatHistory,
                 &availableTools,
+                chatId.clone(),
                 true,
             )
             .await?;
@@ -3215,7 +3226,15 @@ impl EnhancedAIService {
 
     #[allow(non_snake_case)]
     pub fn getRequestWindowEstimate(&self) -> Option<i64> {
-        self.shared_state().request_window_estimate
+        self.shared_state()
+            .request_window_estimate
+            .as_ref()
+            .map(|estimate| estimate.windowSize)
+    }
+
+    #[allow(non_snake_case)]
+    pub fn getRequestWindowEstimateEvent(&self) -> Option<RequestWindowEstimate> {
+        self.shared_state().request_window_estimate.clone()
     }
 
     #[allow(non_snake_case)]

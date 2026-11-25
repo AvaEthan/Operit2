@@ -145,6 +145,9 @@ pub struct ModelConfigDefaults;
 impl ModelConfigDefaults {
     pub const DEFAULT_MAX_CONTEXT_LENGTH: f32 = 200.0;
     pub const DEFAULT_SUMMARY_TOKEN_THRESHOLD: f32 = 0.85;
+    pub const DEFAULT_SUMMARY_SOFT_THRESHOLD_TOKENS: i64 = 12_000;
+    pub const DEFAULT_SUMMARY_DEBOUNCE_TOKENS: i64 = 2_000;
+    pub const DEFAULT_TOOL_RESULT_INLINE_LIMIT: i64 = 4_000;
     pub const DEFAULT_ENABLE_SUMMARY: bool = true;
     pub const DEFAULT_DEEPSEEK_ENDPOINT: &'static str =
         "https://api.deepseek.com/v1/chat/completions";
@@ -298,12 +301,22 @@ impl ModelBuiltinTool {
 pub struct ModelContextSpec {
     #[serde(deserialize_with = "ModelContextSpec::deserialize_length", serialize_with = "ModelContextSpec::serialize_length")]
     pub maxContextLength: f32,
+    #[serde(default = "default_tool_result_inline_limit")]
+    pub toolResultInlineLimit: i64,
+    #[serde(default)]
+    pub foldMiddleTurns: bool,
+}
+
+fn default_tool_result_inline_limit() -> i64 {
+    ModelConfigDefaults::DEFAULT_TOOL_RESULT_INLINE_LIMIT
 }
 
 impl Default for ModelContextSpec {
     fn default() -> Self {
         Self {
             maxContextLength: ModelConfigDefaults::DEFAULT_MAX_CONTEXT_LENGTH,
+            toolResultInlineLimit: ModelConfigDefaults::DEFAULT_TOOL_RESULT_INLINE_LIMIT,
+            foldMiddleTurns: false,
         }
     }
 }
@@ -333,6 +346,12 @@ impl ModelContextSpec {
     pub fn maxContextTokens(&self) -> i32 {
         (f64::from(self.maxContextLength) * 1000.0).clamp(0.0, f64::from(i32::MAX)) as i32
     }
+
+    #[allow(non_snake_case)]
+    pub fn toolResultInlineLimitChars(&self) -> Option<usize> {
+        (self.toolResultInlineLimit > 0)
+            .then(|| usize::try_from(self.toolResultInlineLimit).unwrap_or(usize::MAX))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -341,6 +360,10 @@ pub struct ModelSummarySettings {
     pub enableSummary: bool,
     #[serde(deserialize_with = "ModelSummarySettings::deserialize_threshold")]
     pub summaryTokenThreshold: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summarySoftThresholdTokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summaryDebounceTokens: Option<i64>,
 }
 
 impl Default for ModelSummarySettings {
@@ -348,6 +371,8 @@ impl Default for ModelSummarySettings {
         Self {
             enableSummary: ModelConfigDefaults::DEFAULT_ENABLE_SUMMARY,
             summaryTokenThreshold: ModelConfigDefaults::DEFAULT_SUMMARY_TOKEN_THRESHOLD,
+            summarySoftThresholdTokens: None,
+            summaryDebounceTokens: None,
         }
     }
 }
@@ -367,6 +392,24 @@ impl ModelSummarySettings {
             (threshold / 100.0).clamp(0.0, 1.0)
         } else {
             threshold.clamp(0.0, 1.0)
+        }
+    }
+
+    #[allow(non_snake_case)]
+    pub fn softThresholdTokens(&self) -> Option<i64> {
+        match self.summarySoftThresholdTokens {
+            Some(value) if value > 0 => Some(value),
+            Some(_) => None,
+            None => Some(ModelConfigDefaults::DEFAULT_SUMMARY_SOFT_THRESHOLD_TOKENS),
+        }
+    }
+
+    #[allow(non_snake_case)]
+    pub fn debounceTokens(&self) -> Option<i64> {
+        match self.summaryDebounceTokens {
+            Some(value) if value > 0 => Some(value),
+            Some(_) => None,
+            None => Some(ModelConfigDefaults::DEFAULT_SUMMARY_DEBOUNCE_TOKENS),
         }
     }
 }
@@ -762,14 +805,16 @@ mod tests {
         assert_eq!(serde_json::from_str::<ModelContextSpec>(r#"{"maxContextLength":1e300}"#).unwrap().maxContextLength, ModelContextSpec::MAX_CONTEXT_LENGTH);
         assert_eq!(
             ModelContextSpec {
-                maxContextLength: 128.0
+                maxContextLength: 128.0,
+                ..ModelContextSpec::default()
             }
             .maxContextTokens(),
             128_000
         );
         assert_eq!(
             ModelContextSpec {
-                maxContextLength: 1000.0
+                maxContextLength: 1000.0,
+                ..ModelContextSpec::default()
             }
             .maxContextTokens(),
             1_000_000
@@ -789,5 +834,34 @@ mod tests {
             ..ModelSummarySettings::default()
         };
         assert!((percent.tokenThresholdRatio() - 0.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn context_projection_defaults_preserve_older_serialized_settings() {
+        let legacy: ModelContextSpec =
+            serde_json::from_str(r#"{"maxContextLength":128.0}"#).unwrap();
+        assert_eq!(legacy.toolResultInlineLimitChars(), Some(4000));
+        assert!(!legacy.foldMiddleTurns);
+        let configured: ModelContextSpec = serde_json::from_str(
+            r#"{"maxContextLength":128.0,"toolResultInlineLimit":0,"foldMiddleTurns":true}"#,
+        )
+        .unwrap();
+        assert_eq!(configured.toolResultInlineLimitChars(), None);
+        assert!(configured.foldMiddleTurns);
+    }
+
+    #[test]
+    fn incremental_summary_thresholds_default_and_can_be_disabled() {
+        let defaults = ModelSummarySettings::default();
+        assert_eq!(defaults.softThresholdTokens(), Some(12_000));
+        assert_eq!(defaults.debounceTokens(), Some(2_000));
+
+        let disabled = ModelSummarySettings {
+            summarySoftThresholdTokens: Some(0),
+            summaryDebounceTokens: Some(0),
+            ..defaults
+        };
+        assert_eq!(disabled.softThresholdTokens(), None);
+        assert_eq!(disabled.debounceTokens(), None);
     }
 }

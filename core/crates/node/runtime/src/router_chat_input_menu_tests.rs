@@ -28,6 +28,8 @@ impl TestRouteTarget for MenuEndpoint {
                 currentWindowSize: 123,
                 inputTokenCount: 456,
                 outputTokenCount: 789,
+                cachedInputTokens: 321,
+                latestAssistantInputTokens: 642,
                 maxContextLength: 64.0,
             })
             .unwrap(),
@@ -109,9 +111,11 @@ async fn chat_menu_reads_writes_and_permission_decisions_follow_remote_binding()
             (
                 summary.currentWindowSize,
                 summary.inputTokenCount,
-                summary.outputTokenCount
+                summary.outputTokenCount,
+                summary.cachedInputTokens,
+                summary.latestAssistantInputTokens
             ),
-            (123, 456, 789)
+            (123, 456, 789, 321, 642)
         );
         core.saveChatInputMenuSettings(
             Some(chatId.clone()),

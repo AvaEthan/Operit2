@@ -295,24 +295,7 @@ impl MessagePartDao {
                 "DELETE FROM pending_tool_result_blobs WHERE created_at < ?1",
                 sqliteParams![cutoff],
             )?;
-            transaction.execute(
-                &format!(
-                    r#"DELETE FROM tool_result_blobs
-                       WHERE NOT EXISTS (
-                           SELECT 1 FROM message_parts
-                           WHERE message_parts.chatId = tool_result_blobs.chatId
-                             AND message_parts.kind = 'tool_result'
-                             AND json_valid(message_parts.attributesJson)
-                             AND json_extract(message_parts.attributesJson, '$.{TOOL_RESULT_BLOB_HASH_ATTRIBUTE}') = tool_result_blobs.hash
-                       )
-                       AND NOT EXISTS (
-                           SELECT 1 FROM pending_tool_result_blobs AS live
-                           WHERE live.chatId = tool_result_blobs.chatId
-                             AND live.hash = tool_result_blobs.hash
-                       )"#
-                ),
-                Vec::new(),
-            )?;
+            collectUnreferencedToolResultBlobsInTransaction(transaction)?;
             Ok(expiredPending)
         })
     }
@@ -448,9 +431,68 @@ pub(crate) fn upsertToolResultBlobInTransaction(
     Ok(())
 }
 
+/// Backfills content addresses for persisted tool results that predate blob offload.
+pub(crate) fn normalizeToolResultBlobsInTransaction(
+    transaction: &mut SqliteTransaction<'_>,
+    parts: &mut [MessagePartEntity],
+) -> Result<(), SqliteStoreError> {
+    for part in parts {
+        if part.kind != MessagePartKind::ToolResult || part.content.is_empty() {
+            continue;
+        }
+        let hash = toolResultBlobHash(&part.content);
+        if part.attributes.get(TOOL_RESULT_BLOB_HASH_ATTRIBUTE) == Some(&hash) {
+            continue;
+        }
+        upsertToolResultBlobInTransaction(transaction, &part.chatId, &hash, &part.content)?;
+        part.attributes
+            .insert(TOOL_RESULT_BLOB_HASH_ATTRIBUTE.into(), hash);
+        let attributesJson = serde_json::to_string(&part.attributes).map_err(|error| {
+            SqliteStoreError::Message(format!("message-part attributes cannot serialize: {error}"))
+        })?;
+        transaction.execute(
+            "UPDATE message_parts SET attributesJson = ?1 WHERE chatId = ?2 AND messageTimestamp = ?3 AND variantIndex = ?4 AND partId = ?5",
+            sqliteParams![
+                attributesJson,
+                part.chatId,
+                part.messageTimestamp,
+                part.variantIndex,
+                part.partId
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Drops staged rows past their TTL and blobs no longer referenced by any part.
+pub(crate) fn collectUnreferencedToolResultBlobsInTransaction(
+    transaction: &mut SqliteTransaction<'_>,
+) -> Result<(), SqliteStoreError> {
+    transaction.execute(
+        "DELETE FROM pending_tool_result_blobs WHERE created_at < ?1",
+        sqliteParams![pendingToolResultExpiryCutoff()],
+    )?;
+    transaction.execute(
+        r#"DELETE FROM tool_result_blobs
+           WHERE NOT EXISTS (
+               SELECT 1 FROM message_parts
+               WHERE message_parts.chatId = tool_result_blobs.chatId
+                 AND message_parts.kind = 'tool_result'
+                 AND json_valid(message_parts.attributesJson)
+                 AND json_extract(message_parts.attributesJson, '$.blob_hash') = tool_result_blobs.hash
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM pending_tool_result_blobs AS live
+               WHERE live.chatId = tool_result_blobs.chatId
+                 AND live.hash = tool_result_blobs.hash
+           )"#,
+        Vec::new(),
+    )?;
+    Ok(())
+}
+
 /// Serializes a message part entity for one INSERT statement.
-pub(crate) fn partParams(
-    part: &MessagePartEntity,
+pub(crate) fn partParams(    part: &MessagePartEntity,
 ) -> Result<Vec<operit_host_api::SqliteValue>, SqliteStoreError> {
     let attributesJson = serde_json::to_string(&part.attributes).map_err(|error| {
         SqliteStoreError::Message(format!("message-part attributes cannot serialize: {error}"))

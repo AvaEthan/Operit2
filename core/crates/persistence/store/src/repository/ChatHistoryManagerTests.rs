@@ -63,6 +63,207 @@ fn summary_context_window_update_preserves_completed_reply_totals() {
         .is_err());
 }
 
+#[test]
+fn context_window_compare_and_set_preserves_the_newer_reply() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let (manager, _) = chatOrderFixture("summary-context-window-cas");
+    manager
+        .updateChatTokenCounts("older".to_string(), 100, 20, 120)
+        .unwrap();
+
+    manager
+        .updateChatTokenCounts("older".to_string(), 160, 50, 210)
+        .unwrap();
+    let newer = manager
+        .loadChatHistory("older".to_string())
+        .unwrap()
+        .unwrap();
+    assert!(
+        manager
+            .updateChatContextWindowIfCurrent(
+                "older".to_string(),
+                40,
+                100,
+                20,
+                120,
+                newer.updatedAt.clone()
+            )
+            .unwrap()
+            .is_none()
+    );
+    let persisted = manager
+        .loadChatHistory("older".to_string())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            persisted.inputTokens,
+            persisted.outputTokens,
+            persisted.currentWindowSize
+        ),
+        (160, 50, 210)
+    );
+
+    assert!(
+        manager
+            .updateChatContextWindowIfCurrent(
+                "older".to_string(),
+                40,
+                160,
+                50,
+                210,
+                (newer.updatedAt.parse::<i64>().unwrap() - 1).to_string(),
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        manager
+            .updateChatContextWindowIfCurrent(
+                "older".to_string(),
+                40,
+                160,
+                50,
+                210,
+                newer.updatedAt.clone()
+            )
+            .unwrap()
+            .is_some()
+    );
+    let persisted = manager
+        .loadChatHistory("older".to_string())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            persisted.inputTokens,
+            persisted.outputTokens,
+            persisted.currentWindowSize
+        ),
+        (160, 50, 40)
+    );
+}
+
+/// Preserves summary accounting metadata across the append-only checkpoint round trip.
+#[test]
+fn summary_checkpoint_round_trip_preserves_plugin_extensions() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let (manager, _) = chatOrderFixture("summary-accounting-round-trip");
+    for (timestamp, sender, content) in [
+        (100, "user", "first"),
+        (200, "ai", "summarized"),
+        (300, "user", "retained"),
+        (400, "ai", "reply"),
+    ] {
+        manager
+            .addMessage(
+                "older".into(),
+                ChatMessage::new_with_markdown_timestamp(
+                    sender.into(),
+                    content.into(),
+                    timestamp,
+                ),
+            )
+            .unwrap();
+    }
+    let mut summary =
+        ChatMessage::new_with_markdown_timestamp("summary".into(), "checkpoint".into(), 250);
+    summary.pluginExtensions.insert(
+        "operit.host.context-summary".into(),
+        serde_json::json!({"baselineTimestamp": 400}),
+    );
+    manager
+        .addSummaryMessageBetweenSliceNeighbors(
+            "older".into(),
+            summary,
+            Some(200),
+            Some(300),
+        )
+        .unwrap()
+        .unwrap();
+
+    let messages = manager
+        .loadChatMessagesRange("older".into(), "asc".into(), 0, 79)
+        .unwrap();
+    assert_eq!(
+        messages
+            .iter()
+            .map(|message| message.timestamp)
+            .collect::<Vec<_>>(),
+        vec![100, 200, 250, 300, 400]
+    );
+    assert_eq!(
+        messages[2]
+            .pluginExtensions
+            .get("operit.host.context-summary")
+            .and_then(|value| value.get("baselineTimestamp"))
+            .and_then(serde_json::Value::as_i64),
+        Some(400)
+    );
+}
+
+/// Reads cache usage from the latest assistant message, not later user or summary rows.
+#[test]
+fn latest_assistant_usage_ignores_non_assistant_messages() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let (manager, _) = chatOrderFixture("latest-assistant-cache-usage");
+    for (sender, timestamp, input, cached) in [
+        ("ai", 10, 100, 40),
+        ("ai", 20, 200, 120),
+        ("user", 30, 999, 999),
+        ("summary", 40, 999, 999),
+    ] {
+        let mut message =
+            ChatMessage::new_with_markdown_timestamp(sender.into(), "body".into(), timestamp);
+        message.inputTokens = input;
+        message.cachedInputTokens = cached;
+        manager.addMessage("older".into(), message).unwrap();
+    }
+
+    assert_eq!(
+        manager.loadLatestAssistantTokenUsage("older").unwrap(),
+        Some((200, 120))
+    );
+}
+
+#[test]
+fn latest_assistant_usage_follows_the_selected_variant() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let (manager, _) = chatOrderFixture("selected-variant-usage");
+    let mut message = ChatMessage::new_with_markdown_timestamp("ai".into(), "base".into(), 100);
+    message.inputTokens = 150;
+    message.cachedInputTokens = 50;
+    manager.addMessage("older".into(), message.clone()).unwrap();
+    assert_eq!(
+        manager.loadLatestAssistantTokenUsage("older").unwrap(),
+        Some((150, 50))
+    );
+
+    message.inputTokens = 900;
+    message.cachedInputTokens = 450;
+    let variantIndex = manager
+        .addMessageVariant("older".into(), 100, message)
+        .unwrap();
+    assert_eq!(
+        manager.loadLatestAssistantTokenUsage("older").unwrap(),
+        Some((900, 450))
+    );
+    manager
+        .selectMessageVariant("older".into(), 100, 0)
+        .unwrap();
+    assert_eq!(
+        manager.loadLatestAssistantTokenUsage("older").unwrap(),
+        Some((150, 50))
+    );
+    manager
+        .selectMessageVariant("older".into(), 100, variantIndex)
+        .unwrap();
+    assert_eq!(
+        manager.loadLatestAssistantTokenUsage("older").unwrap(),
+        Some((900, 450))
+    );
+}
+
 /// Opens a chat whose binding arrives before its workspace preference record.
 fn workspaceMetadataFixture(name: &str) -> (ChatHistoryManager, Arc<AppDatabase>, Workspace) {
     crate::PreferencesDataStore::installPreferenceObserverTestHost();

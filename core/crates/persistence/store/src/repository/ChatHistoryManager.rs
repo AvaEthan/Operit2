@@ -1342,6 +1342,34 @@ impl ChatHistoryManager {
         })
     }
 
+    /// Persists a stable estimate only if no reply committed after estimation began.
+    pub fn updateChatContextWindowIfCurrent(
+        &self,
+        chatId: String,
+        currentWindowSize: i64,
+        expectedInputTokens: i64,
+        expectedOutputTokens: i64,
+        expectedWindowSize: i64,
+        expectedUpdatedAt: String,
+    ) -> ChatHistoryManagerResult<Option<ChatHistory>> {
+        let expectedUpdatedAt = expectedUpdatedAt.parse::<i64>().map_err(|_| {
+            ChatHistoryManagerError::IllegalArgument("Chat updatedAt must be an integer".into())
+        })?;
+        if !self.chatDao.updateChatContextWindowIfCurrent(
+            &chatId,
+            currentWindowSize,
+            expectedInputTokens,
+            expectedOutputTokens,
+            expectedWindowSize,
+            expectedUpdatedAt,
+            currentTimeMillis(),
+        )? {
+            return Ok(None);
+        }
+        self.recordChatMetadata(&chatId)?;
+        Ok(self.loadChatHistory(chatId)?)
+    }
+
     /// Persists the active chat id.
     pub fn setCurrentChatId(&self, chatId: String) -> ChatHistoryManagerResult<()> {
         self.currentChatIdDataStore.edit(|preferences| {
@@ -1765,6 +1793,14 @@ impl ChatHistoryManager {
     /// Checks for a newer committed user turn without loading conversation messages.
     pub fn hasUserMessageAfter(&self, chatId: &str, timestamp: i64) -> ChatHistoryManagerResult<bool> {
         Ok(self.messageDao.existsUserMessageAfterTimestamp(chatId, timestamp)?)
+    }
+
+    /// Loads the latest assistant request usage for context cache-hit display.
+    pub fn loadLatestAssistantTokenUsage(
+        &self,
+        chatId: &str,
+    ) -> ChatHistoryManagerResult<Option<(i64, i64)>> {
+        Ok(self.messageDao.getLatestAssistantTokenUsage(chatId)?)
     }
 
     /// Loads runtime-visible messages for model context.

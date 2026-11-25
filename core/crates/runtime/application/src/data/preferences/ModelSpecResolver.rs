@@ -343,7 +343,9 @@ impl ModelSpecResolver {
         context: ModelContextSpec,
     ) -> Option<ModelContextSpec> {
         let inheritedContext = inherited.effectiveContext();
-        (context.maxContextLength.round() != inheritedContext.maxContextLength.round())
+        (context.maxContextLength.round() != inheritedContext.maxContextLength.round()
+            || context.toolResultInlineLimit != inheritedContext.toolResultInlineLimit
+            || context.foldMiddleTurns != inheritedContext.foldMiddleTurns)
             .then_some(context)
     }
 
