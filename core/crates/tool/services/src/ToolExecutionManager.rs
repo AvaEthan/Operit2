@@ -15,6 +15,7 @@ use operit_util::AppLogger::AppLogger;
 use operit_util::ChatMarkupRegex::{attr_value, tag_ranges, ChatMarkupRegex};
 
 const TAG: &str = "ToolExecutionManager";
+const READ_TOOL_RESULT_TOOL_NAME: &str = "read_tool_result";
 const PACKAGE_PROXY_TOOL_NAME: &str = "package_proxy";
 const CLI_PROXY_TOOL_NAME: &str = PROXY_TOOL_NAME;
 const CLI_SEARCH_TOOL_NAME: &str = SEARCH_TOOL_NAME;
@@ -305,6 +306,8 @@ pub struct ToolExecutionBatch {
     pub results: Vec<ToolResult>,
     pub message: String,
     pub displayMessage: String,
+    /// Complete payload addresses, aligned with `results`; `None` keeps a result inline.
+    pub blobHashes: Vec<Option<String>>,
     pub routeChangeIntent: Option<RouteChangeIntent>,
 }
 
@@ -315,7 +318,7 @@ impl ToolExecutionBatch {
         let displayMessage = results.iter()
             .map(|result| ConversationMarkupManager::formatToolResultForDisplay(result, None))
             .collect::<Vec<_>>().join("\n");
-        Self { results, message, displayMessage, routeChangeIntent }
+        Self { results, message, displayMessage, blobHashes: Vec::new(), routeChangeIntent }
     }
 }
 
@@ -423,6 +426,7 @@ impl ToolExecutionManager {
             extensionOwner,
             executionData,
         };
+        let extensionOwner = runtimeContext.extensionOwner.clone();
         runtimeContext.validateExecutionContext()?;
         TOOL_BATCH_SEQUENCE.scope(ToolBatchSequence::default(), Self::scopeToolRuntimeContext(runtimeContext, async move {
         let mut toolHandler = toolHandler.clone();
@@ -499,11 +503,49 @@ impl ToolExecutionManager {
             }
         }
 
-        let message = ConversationMarkupManager::buildToolResultMessage(&modelResults);
-        let displayMessage = results.iter().zip(&modelResults).zip(&displays)
-            .map(|((result, modelResult), display)| ConversationMarkupManager::formatToolResultForDisplayWithModelResult(result, modelResult, display.as_ref()))
+        let blobHashes: Vec<Option<String>> = if let Some(chatId) = callerChatId.as_deref() {
+            results
+                .iter()
+                .map(|result| {
+                    if result.toolName == READ_TOOL_RESULT_TOOL_NAME {
+                        return None;
+                    }
+                    let content = ConversationMarkupManager::toolResultPayload(result);
+                    match toolHandler
+                        .runtimeSupport()
+                        .stageToolResultBlob(
+                            chatId.into(),
+                            callerParticipantId.clone(),
+                            extensionOwner.clone(),
+                            content,
+                        ) {
+                        Ok(hash) => Some(hash),
+                        Err(error) => {
+                            AppLogger::w(
+                                TAG,
+                                &format!(
+                                    "tool.execution.blob_stage_failed tool={} error={error}",
+                                    result.toolName
+                                ),
+                            );
+                            None
+                        }
+                    }
+                })
+                .collect()
+        } else {
+            results.iter().map(|_| None).collect()
+        };
+        let message = ConversationMarkupManager::buildToolResultMessageWithBlobHashes(&modelResults, &blobHashes);
+        let displayMessage = results.iter().zip(&modelResults).zip(&displays).enumerate()
+            .map(|(index, ((result, modelResult), display))| ConversationMarkupManager::formatToolResultForDisplayWithModelResultAndBlobHash(
+                result,
+                modelResult,
+                display.as_ref(),
+                blobHashes.get(index).and_then(Option::as_deref),
+            ))
             .collect::<Vec<_>>().join("\n");
-        let batch = ToolExecutionBatch { results, message, displayMessage, routeChangeIntent };
+        let batch = ToolExecutionBatch { results, message, displayMessage, blobHashes, routeChangeIntent };
         AppLogger::v_with_level(
             TAG,
             &format!(
@@ -577,13 +619,17 @@ impl ToolExecutionManager {
     ) -> Option<ToolResult> {
         let toolName = tool.name.trim();
         let denied = match toolExposureMode {
-            ToolExposureMode::CLI if !Self::isCliPublicTool(toolName) => Some(format!(
-                "{}",
-                CliToolModeSupport::buildCliTopLevelRestrictionErrorMessage(
-                    &Self::resolveDisplayToolName(tool),
-                    true,
-                )
-            )),
+            ToolExposureMode::CLI
+                if !Self::isCliPublicTool(toolName) && toolName != READ_TOOL_RESULT_TOOL_NAME =>
+            {
+                Some(format!(
+                    "{}",
+                    CliToolModeSupport::buildCliTopLevelRestrictionErrorMessage(
+                        &Self::resolveDisplayToolName(tool),
+                        true,
+                    )
+                ))
+            }
             ToolExposureMode::FULL if Self::isCliPublicTool(toolName) => {
                 Some(CliToolModeSupport::buildCliModeUnavailableMessage(true))
             }
@@ -805,6 +851,23 @@ mod tests {
         assert_eq!(restored.matches("Changes: +1 -0 lines").count(), 2);
         assert!(restored.contains("Step error: verification failed"));
         assert!(restored.contains("ordinary output"));
+
+    #[test]
+    fn read_tool_result_is_available_in_both_exposure_modes() {
+        let tool = AITool {
+            name: READ_TOOL_RESULT_TOOL_NAME.to_string(),
+            parameters: Vec::new(),
+        };
+        assert!(ToolExecutionManager::buildToolExposureDeniedResult(
+            &tool,
+            ToolExposureMode::FULL,
+        )
+        .is_none());
+        assert!(ToolExecutionManager::buildToolExposureDeniedResult(
+            &tool,
+            ToolExposureMode::CLI,
+        )
+        .is_none());
     }
 
     /// A rejected later turn must not allow another invocation to bypass unfinished earlier work.

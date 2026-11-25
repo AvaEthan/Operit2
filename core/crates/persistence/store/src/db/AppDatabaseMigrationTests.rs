@@ -105,6 +105,13 @@ fn expectedVersion28Rows(
         .collect()
 }
 
+/// Version 31 introduces the addressed tool-result tables; migrating never moves existing rows.
+fn expectedVersion31Tables(expected: &mut BTreeMap<String, Vec<SqliteRow>>) {
+    for table in ["pending_tool_result_blobs", "tool_result_blobs"] {
+        expected.insert(table.to_string(), Vec::new());
+    }
+}
+
 /// Captures canonical column definitions, foreign keys and indexes for fresh-versus-upgraded schema parity.
 fn schemaDefinitions(store: &SqliteStore) -> BTreeMap<String, Vec<SqliteRow>> {
     let mut definitions = BTreeMap::new();
@@ -194,6 +201,7 @@ fn opening_version27_atomically_upgrades_records_and_reopens_current_version() {
             ]);
         }
     }
+    expectedVersion31Tables(&mut expected);
     let indexes = old
         .store
         .queryRows(
@@ -218,7 +226,7 @@ fn opening_version27_atomically_upgrades_records_and_reopens_current_version() {
         database
             .store
             .queryRows(
-                "SELECT name,tbl_name,sql FROM sqlite_master WHERE type='index' AND name NOT IN ('index_sync_sql_deletions_chat_lifecycle','index_usage_request_records_originNodeId','index_usage_request_records_providerId') ORDER BY name",
+                "SELECT name,tbl_name,sql FROM sqlite_master WHERE type='index' AND name NOT IN ('index_sync_sql_deletions_chat_lifecycle','index_usage_request_records_originNodeId','index_usage_request_records_providerId') AND tbl_name NOT IN ('tool_result_blobs','pending_tool_result_blobs') ORDER BY name",
                 Vec::new()
             )
             .unwrap(),
@@ -407,6 +415,23 @@ fn migration_failure_at_every_boundary_preserves_version27_schema_and_all_record
 }
 
 /// Requires identical columns, defaults, foreign keys and indexes for fresh and migrated current databases.
+#[test]
+fn version30_upgrade_adds_empty_tool_result_blob_tables_without_changing_records() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let (_, database) = version27Database("database-v31-tool-result-blobs");
+    MIGRATION_27_28(&database).unwrap();
+    MIGRATION_28_29(&database).unwrap();
+    MIGRATION_29_30(&database).unwrap();
+    let mut expected = tableRows(&database.store);
+
+    MIGRATION_30_31(&database).unwrap();
+
+    assert_eq!(database.store.getUserVersion().unwrap(), 31);
+    expectedVersion31Tables(&mut expected);
+    assert_eq!(tableRows(&database.store), expected);
+    assert!(database.store.queryRows("PRAGMA foreign_key_check", Vec::new()).unwrap().is_empty());
+}
+
 #[test]
 fn fresh_and_migrated_current_version_have_identical_schema() {
     let _guard = DATABASE_MUTEX.lock().unwrap();

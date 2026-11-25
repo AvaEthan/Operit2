@@ -1556,6 +1556,54 @@ mod tests {
         }
     }
 
+    /// Keeps externalized result previews paired with their original tool calls.
+    #[test]
+    fn externalized_tool_results_remain_protocol_complete_after_projection() {
+        use operit_tools::ConversationMarkupManager::{ConversationMarkupManager, ToolResult};
+        use operit_tools::tools::ToolResultDataClasses::stringResultData;
+
+        let payloads = ["a".repeat(5_000), "b".repeat(5_000)];
+        let results = payloads.iter().map(|payload| ToolResult {
+            toolName: "grep_code".to_string(),
+            success: true,
+            result: stringResultData(payload.clone()),
+            error: None,
+        }).collect::<Vec<_>>();
+        let blobHashes = vec![Some("a".repeat(64)), Some("b".repeat(64))];
+        let message = ConversationMarkupManager::buildToolResultMessageWithBlobHashes(
+            &results,
+            &blobHashes,
+        );
+        let projected = ConversationMarkupManager::projectToolResultMessageForSend(
+            &message,
+            &blobHashes,
+            Some(500),
+        )
+        .unwrap();
+        let history = vec![
+            PromptTurn::new(PromptTurnKind::ASSISTANT, concat!(
+                "<tool name=\"grep_code\"><param name=\"pattern\">first</param></tool>",
+                "<tool name=\"grep_code\"><param name=\"pattern\">second</param></tool>",
+            )),
+            PromptTurn::new(PromptTurnKind::TOOL_RESULT, projected),
+        ];
+        let messages: Value = serde_json::from_str(&StructuredToolCallBridge::buildMessagesJsonForProvider(&history, true, true)).unwrap();
+        let messages = messages.as_array().unwrap();
+        let calls = messages[0]["tool_calls"].as_array().unwrap();
+        let toolMessages = messages.iter().filter(|message| {
+            message.get("role").and_then(Value::as_str) == Some("tool")
+        }).collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(toolMessages.len(), 2);
+        for (call, message) in calls.iter().zip(toolMessages) {
+            assert_eq!(message["tool_call_id"], call["id"]);
+            let content = message["content"].as_str().unwrap();
+            assert!(content.contains("read_tool_result"), "{content}");
+            assert!(!content.contains(&"a".repeat(5_000)));
+            assert!(!content.contains(&"b".repeat(5_000)));
+        }
+    }
+
     /// Verifies overlapping think/thinking ranges cannot invert the slice cursor.
     #[test]
     fn removeThinkingContentToleratesOverlappingThinkRanges() {

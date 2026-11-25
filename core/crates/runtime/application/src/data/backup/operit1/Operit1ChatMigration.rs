@@ -10,11 +10,11 @@ where
     F: FnMut(usize),
 {
     match bridge {
-        Operit1ToOperit2ChatArchiveBridge::Operit1RoomV10ToOperit2SqliteV30 => {
+        Operit1ToOperit2ChatArchiveBridge::Operit1RoomV10ToOperit2SqliteV31 => {
             buildChatArchiveFromOperit1RoomV10Database(connection, fileImportPlan, onMessageParsed)
         }
-        Operit1ToOperit2ChatArchiveBridge::Operit1RoomV20ToOperit2SqliteV30
-        | Operit1ToOperit2ChatArchiveBridge::Operit1RoomV21ToOperit2SqliteV30 => {
+        Operit1ToOperit2ChatArchiveBridge::Operit1RoomV20ToOperit2SqliteV31
+        | Operit1ToOperit2ChatArchiveBridge::Operit1RoomV21ToOperit2SqliteV31 => {
             buildChatArchiveFromOperit1RoomV20Database(connection, fileImportPlan, onMessageParsed)
         }
     }

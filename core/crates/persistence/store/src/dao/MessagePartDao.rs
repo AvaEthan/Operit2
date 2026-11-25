@@ -1,14 +1,36 @@
+use std::fmt::Write;
+
 use crate::sqliteParams;
 use crate::SqliteStore::{toSqliteValue, SqliteRow, SqliteRowGet, SqliteStore, SqliteStoreError, SqliteTransaction};
 
 use operit_model::MessagePart::MessagePartKind;
 use operit_model::MessagePartEntity::MessagePartEntity;
+use sha2::{Digest, Sha256};
 
 const SELECT_PART_COLUMNS: &str = r#"
     SELECT chatId, messageTimestamp, variantIndex, partId, sequence, kind, content,
         toolCallId, toolName, attributesJson
     FROM message_parts
 "#;
+
+/// Attribute that records where a tool result's full payload is kept.
+pub const TOOL_RESULT_BLOB_HASH_ATTRIBUTE: &str = "blob_hash";
+/// Staged results are unreachable until their part is written, so they expire instead of leaking.
+const PENDING_TOOL_RESULT_TTL_MILLIS: i64 = 24 * 60 * 60 * 1000;
+
+/// Computes the content address that identifies one tool result payload.
+pub fn toolResultBlobHash(content: &str) -> String {
+    let digest = Sha256::digest(content.as_bytes());
+    let mut hash = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut hash, "{byte:02x}").expect("hex writing into a String cannot fail");
+    }
+    hash
+}
+
+fn pendingToolResultExpiryCutoff() -> i64 {
+    chrono::Utc::now().timestamp_millis() - PENDING_TOOL_RESULT_TTL_MILLIS
+}
 
 /// Provides persistence operations for ordered structured message parts.
 #[derive(Clone)]
@@ -113,7 +135,15 @@ impl MessagePartDao {
             "DELETE FROM message_parts WHERE chatId = ?1 AND messageTimestamp = ?2 AND variantIndex = ?3",
             sqliteParams![chatId, messageTimestamp, variantIndex],
         )?;
-        for part in parts {
+        let mut blobHashes: Vec<String> = Vec::new();
+        for mut part in parts {
+            if part.kind == MessagePartKind::ToolResult && !part.content.is_empty() {
+                let hash = toolResultBlobHash(&part.content);
+                upsertToolResultBlobInTransaction(transaction, &part.chatId, &hash, &part.content)?;
+                part.attributes
+                    .insert(TOOL_RESULT_BLOB_HASH_ATTRIBUTE.into(), hash.clone());
+                blobHashes.push(hash);
+            }
             transaction.execute(
                 r#"
                 INSERT INTO message_parts (
@@ -125,7 +155,166 @@ impl MessagePartDao {
                 partParams(&part)?,
             )?;
         }
+        if !blobHashes.is_empty() {
+            let placeholders = blobHashes.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let mut params = sqliteParams![chatId];
+            params.extend(blobHashes.iter().map(toSqliteValue));
+            transaction.execute(
+                &format!(
+                    "DELETE FROM pending_tool_result_blobs WHERE chatId = ?1 AND hash IN ({placeholders})"
+                ),
+                params,
+            )?;
+        }
         Ok(())
+    }
+
+    /// Keeps one tool payload addressable before its part row exists, for the extension that produced it.
+    pub fn stageToolResultBlob(
+        &self,
+        chatId: &str,
+        participantId: Option<&str>,
+        extensionOwner: &str,
+        content: &str,
+    ) -> Result<String, SqliteStoreError> {
+        let hash = toolResultBlobHash(content);
+        self.store.transaction(|transaction| {
+            upsertToolResultBlobInTransaction(transaction, chatId, &hash, content)?;
+            transaction.execute(
+                r#"INSERT INTO pending_tool_result_blobs
+                   (chatId, hash, participantId, participantKey, extensionOwner, created_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                   ON CONFLICT(chatId, hash, participantKey, extensionOwner)
+                   DO UPDATE SET created_at = excluded.created_at"#,
+                sqliteParams![
+                    chatId,
+                    hash,
+                    participantId,
+                    participantId.unwrap_or_default(),
+                    extensionOwner,
+                    chrono::Utc::now().timestamp_millis()
+                ],
+            )?;
+            Ok(hash)
+        })
+    }
+
+    /// Reads one character slice of an addressed tool payload that this chat may still reference.
+    ///
+    /// The payload must either belong to a part that is already written in this chat or still be
+    /// staged by the very participant that asks, so another chat cannot address it by hash.
+    pub fn readToolResultBlob(
+        &self,
+        chatId: &str,
+        participantId: Option<&str>,
+        extensionOwner: &str,
+        hash: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<String, SqliteStoreError> {
+        if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(SqliteStoreError::Message(
+                "Tool result blob hash must be 64 hexadecimal characters".into(),
+            ));
+        }
+        let hash = hash.to_ascii_lowercase();
+        let referenced = self
+            .store
+            .queryOne(
+                r#"SELECT 1 FROM message_parts
+                   WHERE chatId = ?1 AND kind = 'tool_result'
+                     AND json_valid(attributesJson)
+                     AND json_extract(attributesJson, '$.blob_hash') = ?2
+                   LIMIT 1"#,
+                sqliteParams![chatId, hash],
+            )?
+            .is_some();
+        let staged = !referenced
+            && self
+                .store
+                .queryOne(
+                    r#"SELECT 1 FROM pending_tool_result_blobs
+                       WHERE chatId = ?1 AND hash = ?2 AND participantKey = ?3
+                         AND extensionOwner = ?4 AND created_at >= ?5
+                       LIMIT 1"#,
+                    sqliteParams![
+                        chatId,
+                        hash,
+                        participantId.unwrap_or_default(),
+                        extensionOwner,
+                        pendingToolResultExpiryCutoff()
+                    ],
+                )?
+                .is_some();
+        if !referenced && !staged {
+            return Err(SqliteStoreError::Message(format!(
+                "Tool result blob {hash} is not referenced by chat {chatId}"
+            )));
+        }
+        let localContent: Option<String> = self
+            .store
+            .queryOne(
+                "SELECT content FROM tool_result_blobs WHERE chatId = ?1 AND hash = ?2",
+                sqliteParams![chatId, hash],
+            )?
+            .map(|row| row.get("content"))
+            .transpose()?;
+        let transcriptContent = if localContent.is_none() && referenced {
+            self.store
+                .queryOne(
+                    r#"SELECT content FROM message_parts
+                       WHERE chatId = ?1 AND kind = 'tool_result'
+                         AND json_valid(attributesJson)
+                         AND json_extract(attributesJson, '$.blob_hash') = ?2
+                       LIMIT 1"#,
+                    sqliteParams![chatId, hash],
+                )?
+                .map(|row| row.get("content"))
+                .transpose()?
+        } else {
+            None
+        };
+        let content = localContent.or(transcriptContent).ok_or_else(|| {
+            SqliteStoreError::Message(format!(
+                "Tool result blob {hash} is unavailable on this device; rerun the original tool to recreate its full result"
+            ))
+        })?;
+        if toolResultBlobHash(&content) != hash {
+            return Err(SqliteStoreError::Message(format!(
+                "Tool result blob {hash} content does not match its hash"
+            )));
+        }
+        Ok(content.chars().skip(offset).take(limit).collect())
+    }
+
+    /// Drops staged payloads that never reached a part row, then the stored copies nobody references.
+    pub fn purgeExpiredToolResultBlobs(&self) -> Result<usize, SqliteStoreError> {
+        let cutoff = pendingToolResultExpiryCutoff();
+        self.store.transaction(|transaction| {
+            let expiredPending = transaction.execute(
+                "DELETE FROM pending_tool_result_blobs WHERE created_at < ?1",
+                sqliteParams![cutoff],
+            )?;
+            transaction.execute(
+                &format!(
+                    r#"DELETE FROM tool_result_blobs
+                       WHERE NOT EXISTS (
+                           SELECT 1 FROM message_parts
+                           WHERE message_parts.chatId = tool_result_blobs.chatId
+                             AND message_parts.kind = 'tool_result'
+                             AND json_valid(message_parts.attributesJson)
+                             AND json_extract(message_parts.attributesJson, '$.{TOOL_RESULT_BLOB_HASH_ATTRIBUTE}') = tool_result_blobs.hash
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM pending_tool_result_blobs AS live
+                           WHERE live.chatId = tool_result_blobs.chatId
+                             AND live.hash = tool_result_blobs.hash
+                       )"#
+                ),
+                Vec::new(),
+            )?;
+            Ok(expiredPending)
+        })
     }
 
     /// Copies all selected revision parts into a different chat identifier.
@@ -235,6 +424,30 @@ pub(crate) fn mapMessagePartEntity(row: &SqliteRow) -> Result<MessagePartEntity,
     })
 }
 
+/// Keeps one payload under its content address for the chat that produced it.
+///
+/// The first writer wins: identical content in the same chat is stored once.
+pub(crate) fn upsertToolResultBlobInTransaction(
+    transaction: &mut SqliteTransaction<'_>,
+    chatId: &str,
+    hash: &str,
+    content: &str,
+) -> Result<(), SqliteStoreError> {
+    transaction.execute(
+        r#"INSERT INTO tool_result_blobs (chatId, hash, bytes, created_at, content)
+           VALUES (?1, ?2, ?3, ?4, ?5)
+           ON CONFLICT(chatId, hash) DO NOTHING"#,
+        sqliteParams![
+            chatId,
+            hash,
+            content.len() as i64,
+            chrono::Utc::now().timestamp_millis(),
+            content
+        ],
+    )?;
+    Ok(())
+}
+
 /// Serializes a message part entity for one INSERT statement.
 pub(crate) fn partParams(
     part: &MessagePartEntity,
@@ -280,3 +493,7 @@ fn partKindFromLabel(value: &str) -> Result<MessagePartKind, SqliteStoreError> {
         ))),
     }
 }
+
+#[cfg(test)]
+#[path = "MessagePartDaoTests.rs"]
+mod blob_tests;

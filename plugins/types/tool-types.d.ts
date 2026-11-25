@@ -122,6 +122,7 @@ export interface ToolResultMap {
   catalog_read_tool_sources: CatalogReadToolSourcesResultData;
   list_core_nodes: string;
   switch_core: string;
+  read_tool_result: string;
   package_proxy: ToolResultData;
   package_wait: JsonResultData;
   get_terminal_info: TerminalInfoResultData;
