@@ -1,0 +1,106 @@
+name: CTX Runtime Build (one-time)
+# 一次性：终端运行时 + Android V8 都在这里编，产物保留 90 天，供 ctx-app-build 跨 run 下载
+# 仅在 tools/android-runtime/、prepare_android_v8.py 或 bridge Cargo.lock 变化时才需要重跑
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-android-runtime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    outputs:
+      v8-version: ${{ steps.v8.outputs.version }}
+    env:
+      RUSTFLAGS: -Awarnings
+      RUST_TOOLCHAIN_VERSION: 1.95.0
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Android runtime build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bison \
+            build-essential \
+            bzip2 \
+            ca-certificates \
+            curl \
+            diffutils \
+            flex \
+            gawk \
+            gzip \
+            patch \
+            pkg-config \
+            tar \
+            unzip \
+            xz-utils
+
+      - name: Fetch Android runtime sources
+        shell: pwsh
+        run: pwsh -NoProfile -File tools/android-runtime/fetch_sources.ps1
+
+      - name: Fetch Android NDKs
+        run: |
+          bash tools/android-runtime/fetch_ndk_wsl.sh
+          cache_dir="$HOME/.cache/operit-android-runtime"
+          v8_ndk_dir="$cache_dir/android-ndk-28.2.13676358"
+          if [ ! -f "$v8_ndk_dir/source.properties" ]; then
+            curl -fL --retry 3 -o "$cache_dir/android-ndk-r28b-linux.zip" \
+              https://dl.google.com/android/repository/android-ndk-r28b-linux.zip
+            rm -rf "$v8_ndk_dir" "$cache_dir/android-ndk-r28b"
+            unzip -q "$cache_dir/android-ndk-r28b-linux.zip" -d "$cache_dir"
+            mv "$cache_dir/android-ndk-r28b" "$v8_ndk_dir"
+            rm -f "$cache_dir/android-ndk-r28b-linux.zip"
+          fi
+          cat "$v8_ndk_dir/source.properties"
+
+      - name: Build Android terminal runtime
+        run: |
+          export ANDROID_NDK_HOME="$HOME/.cache/operit-android-runtime/android-ndk-r29-beta4"
+          bash tools/android-runtime/build_android_tools_wsl.sh
+          bash tools/android-runtime/build_alpine_rootfs_wsl.sh
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          targets: aarch64-linux-android
+
+      - name: Build Android V8
+        id: v8
+        run: |
+          version="$(python3 -c 'import pathlib, tomllib; lock = tomllib.loads(pathlib.Path("apps/flutter/native/operit-flutter-bridge/Cargo.lock").read_text("utf-8")); print(next(p["version"] for p in lock["package"] if p["name"] == "v8"))')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          OPERIT_ANDROID_V8_NDK="$HOME/.cache/operit-android-runtime/android-ndk-28.2.13676358" \
+            python3 tools/build_scripts/prepare_android_v8.py \
+              --target aarch64-linux-android \
+              --env-file tools/release/work/android-v8/aarch64-linux-android.env
+
+      - name: Upload Android V8
+        uses: actions/upload-artifact@v4
+        with:
+          name: operit2-android-v8-${{ github.sha }}
+          path: tools/release/work/android-v8/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload Android terminal runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: operit2-android-runtime-${{ github.sha }}
+          path: |
+            apps/flutter/app/android/app/src/main/jniLibs/arm64-v8a/libbash.so
+            apps/flutter/app/android/app/src/main/jniLibs/arm64-v8a/liboperit_busybox.so
+            apps/flutter/app/android/app/src/main/jniLibs/arm64-v8a/liboperit_loader.so
+            apps/flutter/app/android/app/src/main/jniLibs/arm64-v8a/liboperit_proot.so
+            apps/flutter/app/android/app/src/main/assets/android-runtime/arm64-v8a/rootfs.tar.gz.bin
+            apps/flutter/app/android/app/src/main/assets/android-runtime/arm64-v8a/rootfs.tar.gz.bin.sha256
+          if-no-files-found: error
+          retention-days: 90
