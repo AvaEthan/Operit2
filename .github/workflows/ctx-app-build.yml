@@ -1,9 +1,9 @@
 name: CTX App Build (fast iteration)
 # 日常迭代用这条：不重编终端运行时（跨 run 下载），cargo 走缓存，只出 APK 不打 module
 on:
-  # 非默认分支上 workflow_dispatch 不可用，改用 push 触发：向 ci/ctx-build 推任意提交（含空提交）即跑一次
+  # 非默认分支上 workflow_dispatch 不可用，改用 push 触发：推送到 ci/ctx-build 或任意 build/** 分支即出 APK
   push:
-    branches: ['ci/ctx-build']
+    branches: ['ci/ctx-build', 'build/**']
   workflow_dispatch:
     inputs:
       runtime_run_id:
