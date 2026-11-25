@@ -67,6 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build the Operit2 Android Flutter app.")
     parser.add_argument("--build-name")
     parser.add_argument("--build-number")
+    parser.add_argument("--application-id")
     parser.add_argument("--enforce-lockfile", action="store_true")
     parser.add_argument("--skip-proxy-generation", action="store_true")
     parser.add_argument("--skip-signing", action="store_true")
@@ -139,6 +140,8 @@ def main() -> int:
         "android-arm64",
         "--android-project-arg=operitRuntime=app",
     ]
+    if args.application_id:
+        command.append(f"--android-project-arg=operitApplicationId={args.application_id}")
     if args.build_name:
         command.extend(["--build-name", args.build_name])
     if args.build_number:
