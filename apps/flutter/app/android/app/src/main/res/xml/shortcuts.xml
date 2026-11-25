@@ -8,7 +8,7 @@
         android:shortcutLongLabel="@string/data_rescue_shortcut_long">
         <intent
             android:action="android.intent.action.VIEW"
-            android:targetPackage="app.operit"
+            android:targetPackage="@string/operit_target_package"
             android:targetClass="app.operit.DataRescueActivity" />
     </shortcut>
 </shortcuts>
