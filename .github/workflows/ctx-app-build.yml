@@ -85,7 +85,7 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: "21"
 
       - name: Install FVM
         shell: pwsh
@@ -126,6 +126,23 @@ jobs:
           if (-not (Test-Path -LiteralPath $libclang)) {
             throw "Android bindgen libclang was not prepared at $libclang"
           }
+
+      - name: Install repository build tools
+        shell: pwsh
+        run: |
+          npm install --prefix .ci-tools/typescript --no-audit --no-fund typescript@5.9.3
+          corepack enable pnpm
+          python -m venv .venv
+
+      - name: Install Emscripten
+        shell: pwsh
+        run: |
+          if (-not (Test-Path .ci-tools/emsdk/emsdk.py)) {
+            git clone --depth 1 https://github.com/emscripten-core/emsdk.git .ci-tools/emsdk
+          }
+          python .ci-tools/emsdk/emsdk.py install 4.0.14
+          python .ci-tools/emsdk/emsdk.py activate 4.0.14
+          .venv/Scripts/python.exe .ci-tools/emsdk/upstream/emscripten/em++.py --version
 
       - name: Restore Android signing material
         shell: pwsh
