@@ -73,7 +73,6 @@ jobs:
       RUSTFLAGS: -Awarnings
       RUST_TOOLCHAIN_VERSION: 1.95.0
       FVM_VERSION: 4.3.0
-      ORG_GRADLE_PROJECT_operitApplicationId: app.operit.test
 
     steps:
       - name: Checkout
@@ -176,7 +175,7 @@ jobs:
           if ($version.Count -ne 1) {
             throw "apps/flutter/app/pubspec.yaml must contain exactly one release version line"
           }
-          python tools/build_scripts/build_flutter_android.py --build-name $version[0].Groups[1].Value --build-number $version[0].Groups[2].Value --enforce-lockfile
+          python tools/build_scripts/build_flutter_android.py --build-name $version[0].Groups[1].Value --build-number $version[0].Groups[2].Value --application-id app.operit.test --enforce-lockfile
 
       - name: Build and package Android module
         shell: pwsh
