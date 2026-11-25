@@ -2,6 +2,9 @@ name: CTX Runtime Build (one-time)
 # 一次性：终端运行时 + Android V8 都在这里编，产物保留 90 天，供 ctx-app-build 跨 run 下载
 # 仅在 tools/android-runtime/、prepare_android_v8.py 或 bridge Cargo.lock 变化时才需要重跑
 on:
+  # 非默认分支上 workflow_dispatch 不可用，改用 push 触发：向 ci/ctx-runtime 推提交（含 --allow-empty 空提交）即重跑
+  push:
+    branches: ['ci/ctx-runtime']
   workflow_dispatch:
 
 permissions:

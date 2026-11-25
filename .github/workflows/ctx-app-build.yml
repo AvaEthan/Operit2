@@ -1,11 +1,15 @@
 name: CTX App Build (fast iteration)
 # 日常迭代用这条：不重编终端运行时（跨 run 下载），cargo 走缓存，只出 APK 不打 module
 on:
+  # 非默认分支上 workflow_dispatch 不可用，改用 push 触发：向 ci/ctx-build 推任意提交（含空提交）即跑一次
+  push:
+    branches: ['ci/ctx-build']
   workflow_dispatch:
     inputs:
       runtime_run_id:
-        description: "ctx-runtime-build 那次 run 的 ID（其 artifact 名 = operit2-android-runtime-<该run的sha>）"
-        required: true
+        description: "ctx-runtime-build 那次 run 的 ID（留空 = 自动取 ci/ctx-runtime 最近一次成功 run）"
+        required: false
+        default: ""
         type: string
 
 permissions:
@@ -27,9 +31,20 @@ jobs:
       - name: Resolve runtime artifact names
         shell: pwsh
         run: |
-          $sha = gh api repos/${{ github.repository }}/actions/runs/${{ inputs.runtime_run_id }} --jq .head_sha
-          "RUNTIME_ARTIFACT=operit2-android-runtime-$sha" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "V8_ARTIFACT=operit2-android-v8-$sha" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $repo = "${{ github.repository }}"
+          $runId = "${{ inputs.runtime_run_id }}"
+          if ([string]::IsNullOrWhiteSpace($runId)) {
+            $resp = gh api "repos/$repo/actions/workflows/ctx-runtime-build.yml/runs" -f branch=ci/ctx-runtime -f status=success -f per_page=1 | ConvertFrom-Json
+            $run = $resp.workflow_runs[0]
+          } else {
+            $run = gh api "repos/$repo/actions/runs/$runId" | ConvertFrom-Json
+          }
+          if (-not $run) {
+            throw "未找到成功的 ctx-runtime-build run：请先在 ci/ctx-runtime 分支上跑一次该 workflow"
+          }
+          "RUN_ID=$($run.id)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RUNTIME_ARTIFACT=operit2-android-runtime-$($run.head_sha)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "V8_ARTIFACT=operit2-android-v8-$($run.head_sha)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
         env:
           GH_TOKEN: ${{ github.token }}
 
@@ -39,7 +54,7 @@ jobs:
           name: ${{ env.RUNTIME_ARTIFACT }}
           path: apps/flutter/app/android/app/src/main
           repository: ${{ github.repository }}
-          run-id: ${{ inputs.runtime_run_id }}
+          run-id: ${{ env.RUN_ID }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download Android V8 (reuse, no rebuild)
@@ -48,7 +63,7 @@ jobs:
           name: ${{ env.V8_ARTIFACT }}
           path: tools/release/work/android-v8
           repository: ${{ github.repository }}
-          run-id: ${{ inputs.runtime_run_id }}
+          run-id: ${{ env.RUN_ID }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install bootstrap Dart
