@@ -34,9 +34,13 @@ jobs:
           $repo = "${{ github.repository }}"
           $runId = "${{ inputs.runtime_run_id }}"
           if ([string]::IsNullOrWhiteSpace($runId)) {
-            # 按文件名查 workflow 需要默认分支注册（404），改用 runs?branch 查询：ci/ctx-runtime 上只有 runtime 工作流会跑
-            $resp = gh api "repos/$repo/actions/runs" -f branch=ci/ctx-runtime -f status=success -f per_page=1 | ConvertFrom-Json
-            $run = $resp.workflow_runs[0]
+            # workflow 实体不在默认分支注册：服务端按名/分支过滤均不可用，拉取后在本地筛
+            $resp = gh api "repos/$repo/actions/runs?per_page=100" | ConvertFrom-Json
+            $run = $resp.workflow_runs | Where-Object {
+              $_.head_branch -eq 'ci/ctx-runtime' -and
+              $_.name -eq 'CTX Runtime Build (one-time)' -and
+              $_.status -eq 'completed' -and $_.conclusion -eq 'success'
+            } | Select-Object -First 1
           } else {
             $run = gh api "repos/$repo/actions/runs/$runId" | ConvertFrom-Json
           }
