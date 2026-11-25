@@ -76,14 +76,17 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
           targets: aarch64-linux-android
 
-      - name: Install LLVM 21 for V8 source bindings
-        # runner 镜像自带 llvm < 21，prepare_android_v8.py 的 libclang 检查要求 >= 21.1
+      - name: Install libclang 21 for V8 source bindings
+        # prepare_android_v8.py 与 bindgen 都按 libclang.so* 扫描，
+        # 而 apt.llvm.org 实际装的是 /usr/lib/x86_64-linux-gnu/libclang-21.so.21，需补一个匹配命名的符号链接
         run: |
           sudo mkdir -p /etc/apt/keyrings
           curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/keyrings/apt.llvm.org.asc >/dev/null
           echo 'deb [signed-by=/etc/apt/keyrings/apt.llvm.org.asc] http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main' | sudo tee /etc/apt/sources.list.d/llvm-21.list
           sudo apt-get update
-          sudo apt-get install -y clang-21 lld-21 libclang-21-dev llvm-21-dev
+          sudo apt-get install -y libclang1-21 lld-21
+          sudo mkdir -p /usr/lib/llvm-21/lib
+          sudo ln -sf /usr/lib/x86_64-linux-gnu/libclang-21.so.21 /usr/lib/llvm-21/lib/libclang.so.21
 
       - name: Build Android V8
         id: v8
