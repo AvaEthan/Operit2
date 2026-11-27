@@ -2488,7 +2488,39 @@ impl ChatHistoryDelegate {
             return None;
         };
         if isCurrentChat {
-            self.reloadCurrentChatDisplayHistory(chatId);
+            // Keep the reader's position: when the display window is paged back into
+            // history (newer pages exist), a plain reload re-anchors to the newest
+            // page and yanks the view to the bottom. Insert the persisted summary
+            // into the in-memory window only when its neighbors are on screen;
+            // otherwise the next explicit page load will surface it.
+            let mut window = self.currentChatMessagesSnapshot();
+            let insert_at = window
+                .iter()
+                .position(|message| Some(message.timestamp) == afterTimestamp)
+                .or_else(|| {
+                    beforeTimestamp.and_then(|before| {
+                        window
+                            .iter()
+                            .position(|message| message.timestamp == before)
+                            .map(|index| index + 1)
+                    })
+                });
+            match insert_at {
+                Some(index) => {
+                    window.insert(index, persisted.clone());
+                    let has_older = self.currentChatWindow.hasOlderDisplayHistory;
+                    let has_newer = self.currentChatWindow.hasNewerDisplayHistory;
+                    self.applyCurrentChatDisplayWindowWithFlags(
+                        chatId, window, has_older, has_newer,
+                    );
+                }
+                None if !self.currentChatWindow.hasNewerDisplayHistory => {
+                    self.reloadCurrentChatDisplayHistory(chatId);
+                }
+                None => {
+                    // Summary landed outside the paged-back window; leave the view alone.
+                }
+            }
         }
         Some(persisted)
     }
