@@ -924,9 +924,17 @@ impl MessageCoordinationDelegate {
             chatId: Some(chatId.clone()), executionParticipantId: Some(participantId),
             ..SendMessageOptions::new()
         }).await.map_err(|error| error.to_string())?;
-        let window = self.refreshStableContextWindow(
-            service, Some(chatId.clone()), None, Some(PromptFunctionType::CHAT), None, None,
-        ).await.ok_or_else(|| format!("Failed to refresh context after reply: {chatId}"))?;
+        // C6: the after-reply guard must use the same window basis as the before-send
+        // guard (the persisted, folded chat window). The runtime stable estimate includes
+        // unfolded history and every tool description, so it overstates the real request
+        // window and used to trigger a summary after almost every reply.
+        let window = self
+            .chatHistoryDelegate
+            .chatHistoryManager
+            .loadChatHistory(chatId.clone())
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("Chat does not exist: {chatId}"))?
+            .currentWindowSize;
         let messages = self.chatHistoryDelegate.getRuntimeChatHistory(chatId.clone());
         for participant in &configuration.participants {
             let settings = self.messageProcessingDelegate.modelConfigManager.getResolvedModelConfig(
@@ -1430,6 +1438,29 @@ mod summary_send_policy_tests {
 #[cfg(test)]
 mod automatic_summary_tests {
     use super::*;
+
+    /// C6 regression: the after-reply summary guard must judge the persisted (folded)
+    /// chat window, exactly like the before-send guard. A runtime stable estimate can
+    /// be far larger (unfolded history + every tool description); using it here used to
+    /// fire a summary after almost every reply even at 13% real usage.
+    #[test]
+    fn after_reply_guard_uses_persisted_window_not_runtime_estimate() {
+        let max_tokens = 1_000_000;
+        let threshold = 0.4;
+        let persisted_window = 128_244; // folded DB window (~13%)
+        let runtime_estimate = 500_000; // inflated stable estimate (~50%)
+        assert!(!AIMessageManager::shouldGenerateSummary(
+            persisted_window, max_tokens, threshold, true,
+        ));
+        // The old basis would have triggered; guard against regressions to it.
+        assert!(AIMessageManager::shouldGenerateSummary(
+            runtime_estimate, max_tokens, threshold, true,
+        ));
+        // A genuinely large persisted window still triggers at the configured ratio.
+        assert!(AIMessageManager::shouldGenerateSummary(
+            400_000, max_tokens, threshold, true,
+        ));
+    }
 
     /// Changed history is reconsidered; a new turn alone preserves the captured boundary.
     #[test]
