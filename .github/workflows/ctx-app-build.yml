@@ -120,9 +120,29 @@ jobs:
           $packageDir = Join-Path $toolsDir $packageName
           $archive = Join-Path $toolsDir "$packageName.nupkg"
           New-Item -ItemType Directory -Force -Path $toolsDir | Out-Null
-          Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/libclang.runtime.win-x64/$version" -OutFile $archive
-          Expand-Archive -Path $archive -DestinationPath $packageDir -Force
           $libclang = Join-Path $packageDir "runtimes/win-x64/native/libclang.dll"
+          if (-not (Test-Path -LiteralPath $libclang)) {
+            $urls = @(
+              "https://www.nuget.org/api/v2/package/libclang.runtime.win-x64/$version",
+              "https://api.nuget.org/v3-flatcontainer/libclang.runtime.win-x64/$version/libclang.runtime.win-x64.$version.nupkg"
+            )
+            $ok = $false
+            foreach ($url in $urls) {
+              for ($attempt = 1; $attempt -le 3; $attempt++) {
+                try {
+                  Invoke-WebRequest -Uri $url -OutFile $archive -TimeoutSec 120
+                  Expand-Archive -Path $archive -DestinationPath $packageDir -Force
+                  $ok = $true
+                  break
+                } catch {
+                  Write-Host "libclang download attempt $attempt failed from ${url}: $_"
+                  Start-Sleep -Seconds (5 * $attempt)
+                }
+              }
+              if ($ok) { break }
+            }
+            if (-not $ok) { throw "libclang download failed from all mirrors" }
+          }
           if (-not (Test-Path -LiteralPath $libclang)) {
             throw "Android bindgen libclang was not prepared at $libclang"
           }
