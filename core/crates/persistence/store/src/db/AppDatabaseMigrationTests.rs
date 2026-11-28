@@ -105,7 +105,7 @@ fn expectedVersion28Rows(
         .collect()
 }
 
-/// Version 31 introduces the addressed tool-result tables; migrating never moves existing rows.
+/// Version 33 introduces the addressed tool-result tables; migrating never moves existing rows.
 fn expectedVersion31Tables(expected: &mut BTreeMap<String, Vec<SqliteRow>>) {
     for table in ["pending_tool_result_blobs", "tool_result_blobs"] {
         expected.insert(table.to_string(), Vec::new());
@@ -416,17 +416,19 @@ fn migration_failure_at_every_boundary_preserves_version27_schema_and_all_record
 
 /// Requires identical columns, defaults, foreign keys and indexes for fresh and migrated current databases.
 #[test]
-fn version30_upgrade_adds_empty_tool_result_blob_tables_without_changing_records() {
+fn version32_upgrade_adds_empty_tool_result_blob_tables_without_changing_records() {
     let _guard = DATABASE_MUTEX.lock().unwrap();
-    let (_, database) = version27Database("database-v31-tool-result-blobs");
+    let (_, database) = version27Database("database-v33-tool-result-blobs");
     MIGRATION_27_28(&database).unwrap();
     MIGRATION_28_29(&database).unwrap();
     MIGRATION_29_30(&database).unwrap();
+    MIGRATION_30_31(&database).unwrap();
+    MIGRATION_31_32(&database).unwrap();
     let mut expected = tableRows(&database.store);
 
-    MIGRATION_30_31(&database).unwrap();
+    MIGRATION_32_33(&database).unwrap();
 
-    assert_eq!(database.store.getUserVersion().unwrap(), 31);
+    assert_eq!(database.store.getUserVersion().unwrap(), 33);
     expectedVersion31Tables(&mut expected);
     assert_eq!(tableRows(&database.store), expected);
     assert!(database.store.queryRows("PRAGMA foreign_key_check", Vec::new()).unwrap().is_empty());
