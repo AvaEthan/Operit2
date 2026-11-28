@@ -1452,6 +1452,9 @@ fn MIGRATION_30_31(database: &AppDatabase) -> Result<(), SqliteStoreError> {
             Vec::new(),
         )?;
         transaction.execute("PRAGMA user_version = 31", Vec::new())?;
+        Ok(())
+    })
+}
 
 /// Stores repeated tool payloads once per chat so the transcript can keep a hash
 /// stub instead of the full output, and tracks staged outputs that no part references yet.
