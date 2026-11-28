@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use http::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
@@ -869,7 +870,91 @@ impl OpenAIProvider {
         )?;
         json_object.insert("messages".to_string(), messagesArray);
 
+        // Cache-affinity routing for official OpenAI chat completions: a stable key derived from
+        // the leading system/user anchor keeps successive requests (including summary turns) on
+        // the same cache shard. Generic OpenAI-compatible endpoints may reject unknown fields,
+        // so the key is attached only for the official OPENAI provider type.
+        if self.provider_type == "OPENAI" && !json_object.contains_key("prompt_cache_key") {
+            if let Some(messages) = json_object.get("messages").and_then(Value::as_array) {
+                if let Some(key) = Self::build_chat_prompt_cache_key(
+                    &self.model_name,
+                    self.enable_tool_call,
+                    messages,
+                    toolsJson.as_deref(),
+                ) {
+                    json_object.insert("prompt_cache_key".to_string(), json!(key));
+                }
+            }
+        }
+
         Ok(request_object)
+    }
+
+    /// Derives a stable prompt cache key from the leading stable prefix (system + first user turn).
+    /// Later history growth and appended summaries never change the anchor, so routing stays sticky.
+    #[allow(non_snake_case)]
+    fn build_chat_prompt_cache_key(
+        modelName: &str,
+        enableToolCall: bool,
+        messagesArray: &[Value],
+        toolsJson: Option<&str>,
+    ) -> Option<String> {
+        if messagesArray.is_empty() && toolsJson.is_none_or(str::is_empty) {
+            return None;
+        }
+        let mut anchorParts = Vec::new();
+        let mut assistantOrToolSeen = false;
+        for message in messagesArray {
+            let Some(messageObject) = message.as_object() else { continue; };
+            let role = messageObject.get("role").and_then(Value::as_str).unwrap_or_default();
+            if role.is_empty() { continue; }
+            if role == "assistant" || role == "tool" {
+                assistantOrToolSeen = true;
+                break;
+            }
+            if role == "system" || role == "developer" {
+                anchorParts.push(format!(
+                    "{}:{}", role,
+                    messageObject.get("content").map(Value::to_string).unwrap_or_default()
+                ));
+                continue;
+            }
+            if role == "user" {
+                anchorParts.push(format!(
+                    "{}:{}", role,
+                    messageObject.get("content").map(Value::to_string).unwrap_or_default()
+                ));
+                break;
+            }
+        }
+        if anchorParts.is_empty() && assistantOrToolSeen {
+            if let Some(firstMessage) = messagesArray.first().and_then(Value::as_object) {
+                anchorParts.push(format!(
+                    "{}:{}",
+                    firstMessage.get("role").and_then(Value::as_str).unwrap_or("unknown"),
+                    firstMessage.get("content").map(Value::to_string).unwrap_or_default()
+                ));
+            }
+        }
+        let mut digestInput = String::new();
+        digestInput.push_str("operit:chat_prompt_cache:v1");
+        digestInput.push_str("|model=");
+        digestInput.push_str(modelName);
+        digestInput.push_str("|toolCall=");
+        digestInput.push_str(if enableToolCall { "true" } else { "false" });
+        if let Some(toolsJson) = toolsJson {
+            if !toolsJson.trim().is_empty() {
+                digestInput.push_str("|tools=");
+                digestInput.push_str(toolsJson);
+            }
+        }
+        for part in anchorParts {
+            digestInput.push_str("|anchor=");
+            digestInput.push_str(&part);
+        }
+        let digest = Sha256::digest(digestInput.as_bytes());
+        let hex = digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        Some(format!("operit_chat_{}", &hex[..48]))
     }
 
     pub fn create_request_body_internal(

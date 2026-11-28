@@ -394,3 +394,41 @@ async fn cancelled_and_successful_requests_do_not_report_terminal_failure() {
         assert_eq!(ensure_response_completed(&output), Ok(()));
     }
 }
+
+/// Official OPENAI chat completions carry a stable prompt_cache_key that survives history growth.
+#[test]
+fn officialOpenAiAttachesStablePromptCacheKey() {
+    let provider = OpenAIProvider::new(
+        "http://localhost".to_string(),
+        String::new().into(),
+        "test-model".to_string(),
+        "OPENAI".to_string(),
+        Vec::new(),
+        true,
+    );
+    let base = vec![
+        PromptTurn::new(PromptTurnKind::SYSTEM, "stable system".to_string()),
+        PromptTurn::new(PromptTurnKind::USER, "first question".to_string()),
+    ];
+    let body1 = provider.create_request_body(&sendRequest(base.clone())).unwrap();
+    let key1 = body1.get("prompt_cache_key").and_then(serde_json::Value::as_str)
+        .expect("official OPENAI must attach prompt_cache_key").to_string();
+    assert!(key1.starts_with("operit_chat_"));
+    let mut grown = base;
+    grown.push(PromptTurn::new(PromptTurnKind::ASSISTANT, "reply".to_string()));
+    grown.push(PromptTurn::new(PromptTurnKind::SUMMARY, "appended summary".to_string()));
+    grown.push(PromptTurn::new(PromptTurnKind::USER, "next question".to_string()));
+    let body2 = provider.create_request_body(&sendRequest(grown)).unwrap();
+    let key2 = body2.get("prompt_cache_key").and_then(serde_json::Value::as_str).unwrap();
+    assert_eq!(key1, key2, "cache key must stay stable as history and summaries append");
+}
+
+/// Generic OpenAI-compatible endpoints must not receive the unknown prompt_cache_key field.
+#[test]
+fn genericOpenAiOmitsPromptCacheKey() {
+    let provider = testProvider();
+    let body = provider.create_request_body(&sendRequest(vec![PromptTurn::new(
+        PromptTurnKind::USER, "hello".to_string(),
+    )])).unwrap();
+    assert!(body.get("prompt_cache_key").is_none());
+}

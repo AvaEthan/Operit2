@@ -851,6 +851,7 @@ mod tests {
         assert_eq!(restored.matches("Changes: +1 -0 lines").count(), 2);
         assert!(restored.contains("Step error: verification failed"));
         assert!(restored.contains("ordinary output"));
+    }
 
     #[test]
     fn read_tool_result_is_available_in_both_exposure_modes() {

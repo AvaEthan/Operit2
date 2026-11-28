@@ -3457,6 +3457,7 @@ mod tests {
 
     #[test]
     fn sync_provider_models_reconciles_chat_and_function_bindings() {
+        use crate::data::preferences::ModelConfigManager::FunctionalConfigManager;
         use operit_model::FunctionType::FunctionType;
         use operit_model::ModelConfigData::ModelProfile;
 

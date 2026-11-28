@@ -583,7 +583,7 @@ impl AIMessageManager {
 
         let startTime = ChatMessageTimestampAllocator::currentTimeMillis();
         let (summary, usage) = enhancedAiService
-            .generateSummaryForConfiguration(conversationToSummarize, previousSummary, chatId, configuration, options, progress, trigger, onNonFatalError)
+            .generateSummaryForConfiguration(conversationToSummarize, previousSummary, chatId.clone(), configuration, options, progress, trigger, onNonFatalError)
             .await?;
         let endTime = ChatMessageTimestampAllocator::currentTimeMillis();
         if summary.trim().is_empty() {
@@ -593,6 +593,9 @@ impl AIMessageManager {
         let mut summaryWithQuotes = summary.trim().to_string();
         // Keep the review in the same language as the summary prompt.
         appendConversationReview(&mut summaryWithQuotes, &conversationReviewEntries, false);
+        // H4 work handoff: re-inject durable workspace state at the summary tail so the
+        // post-compaction turn resumes from the ledger instead of relying on folded history.
+        appendWorkHandoff(&mut summaryWithQuotes, enhancedAiService, &chatId).await;
 
         let finalSummary = if autoContinue {
             format!(
@@ -677,8 +680,19 @@ impl AIMessageManager {
     pub fn getMemoryFromMessages(
         messages: Vec<ChatMessage>, configuration: &ChatConfigurationResult,
     ) -> Result<Vec<PromptTurn>, AiServiceError> {
-        let lastSummaryIndex = messages.iter().rposition(|message| message.sender == "summary");
-        let relevantMessages = match lastSummaryIndex { Some(index) => &messages[index..], None => messages.as_slice() };
+        // Deferred compaction: keep the second-to-last checkpoint as the projection head so a
+        // freshly appended summary never rewrites the already-sent prefix. The previous generation
+        // is folded only when the next summary lands, turning cache invalidation into pure appends.
+        let summaryIndices: Vec<usize> = messages.iter().enumerate()
+            .filter(|(_, message)| message.sender == "summary")
+            .map(|(index, _)| index)
+            .collect();
+        let projectionStart = if summaryIndices.len() >= 2 {
+            summaryIndices[summaryIndices.len() - 2]
+        } else {
+            summaryIndices.last().copied().unwrap_or(0)
+        };
+        let relevantMessages = &messages[projectionStart..];
         let mut turns = Vec::new();
         for message in relevantMessages {
             match message.sender.as_str() {
@@ -1280,6 +1294,58 @@ fn appendConversationReview(summary: &mut String, entries: &[(String, String)], 
     appendEntries(summary, &entries[entries.len() - tailCount..]);
 }
 
+/// Caps for the deterministic work-handoff block appended after the conversation review.
+const WORK_HANDOFF_FILES: [&str; 2] = ["task/STATE.md", "PROJECT.md"];
+const WORK_HANDOFF_PER_FILE_CHARS: usize = 6000;
+
+/// Appends durable workspace ledgers (STATE/PROJECT) to a fresh summary. Pure tail append:
+/// never touches the already-sent prefix, and silently skips unreadable or remote files.
+#[allow(non_snake_case)]
+async fn appendWorkHandoff(
+    summary: &mut String,
+    enhancedAiService: &mut EnhancedAIService,
+    chatId: &str,
+) {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    let directory = match operit_store::repository::ChatHistoryManager::ChatHistoryManager::default()
+        .ok()
+        .and_then(|manager| manager.fileDirectoryForChat(chatId).ok())
+    {
+        Some(directory) => directory,
+        None => return,
+    };
+    let mut sections = Vec::<String>::new();
+    for relative in WORK_HANDOFF_FILES {
+        let Ok(path) = operit_vfs::VfsPath::joinVfsPath(&directory, relative) else { continue; };
+        // Only local files: remote mounts would need cross-node IO inside the summary path.
+        if operit_util::FileUtils::FileUtils::splitQualifiedVfsPath(&path).is_some() { continue; }
+        let result = enhancedAiService.tool_handler.clone().executeTool(
+            operit_tools::ToolExecutionManager::AITool {
+                name: "read_file_binary".to_string(),
+                parameters: vec![operit_tools::ToolExecutionManager::ToolParameter {
+                    name: "path".to_string(), value: path,
+                }],
+            },
+        ).await;
+        if !result.success { continue; }
+        let operit_tools::tools::ToolResultDataClasses::ToolResultData::BinaryFileContentData(bytes) = result.result else { continue; };
+        let Ok(decoded) = STANDARD.decode(bytes.contentBase64) else { continue; };
+        let Ok(text) = String::from_utf8(decoded) else { continue; };
+        let text = text.trim();
+        if text.is_empty() { continue; }
+        let clipped: String = if text.chars().count() > WORK_HANDOFF_PER_FILE_CHARS {
+            let head: String = text.chars().take(WORK_HANDOFF_PER_FILE_CHARS).collect();
+            format!("{head}\n...[已截断，完整内容用 read_file 读取 {relative}]")
+        } else { text.to_string() };
+        sections.push(format!("### {relative}\n{clipped}"));
+    }
+    if sections.is_empty() { return; }
+    summary.push_str("\n\n【工作交接快照】\n");
+    summary.push_str(&sections.join("\n\n"));
+    summary.push('\n');
+}
+
 #[allow(non_snake_case)]
 fn cleanSummarySourceMessage(message: &ChatMessage) -> String {
     let source = if message.sender == "ai" {
@@ -1626,6 +1692,49 @@ mod tests {
         let turns = AIMessageManager::getMemoryFromMessages(vec![peer], &historyConfiguration(true, true)).unwrap();
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].content, "[From role: Peer]\nPublic reply");
+    }
+
+    /// Two checkpoints keep the older head so the newest summary only appends to the sent prefix.
+    #[test]
+    fn deferred_compaction_keeps_previous_generation_after_new_summary() {
+        let oldSummary = ChatMessage::new_with_markdown_timestamp("summary".into(), "GEN1".into(), 10);
+        let sentUser = ChatMessage::new_with_markdown_timestamp("user".into(), "already sent".into(), 20);
+        let newSummary = ChatMessage::new_with_markdown_timestamp("summary".into(), "GEN2".into(), 30);
+        let tailUser = ChatMessage::new_with_markdown_timestamp("user".into(), "fresh tail".into(), 40);
+        let turns = AIMessageManager::getMemoryFromMessages(
+            vec![oldSummary, sentUser, newSummary, tailUser], &historyConfiguration(false, false)).unwrap();
+        assert_eq!(turns.iter().map(|turn| turn.content.as_str()).collect::<Vec<_>>(),
+            vec!["GEN1", "already sent", "GEN2", "fresh tail"]);
+        assert_eq!(turns[0].kind, PromptTurnKind::SUMMARY);
+        assert_eq!(turns[2].kind, PromptTurnKind::SUMMARY);
+    }
+
+    /// Three checkpoints fold everything before the second-to-last one (lag of exactly one generation).
+    #[test]
+    fn deferred_compaction_folds_generations_older_than_previous() {
+        let stale = ChatMessage::new_with_markdown_timestamp("user".into(), "prehistoric".into(), 5);
+        let gen1 = ChatMessage::new_with_markdown_timestamp("summary".into(), "GEN1".into(), 10);
+        let gen1Tail = ChatMessage::new_with_markdown_timestamp("user".into(), "gen1 tail".into(), 15);
+        let gen2 = ChatMessage::new_with_markdown_timestamp("summary".into(), "GEN2".into(), 20);
+        let gen2Tail = ChatMessage::new_with_markdown_timestamp("user".into(), "gen2 tail".into(), 25);
+        let gen3 = ChatMessage::new_with_markdown_timestamp("summary".into(), "GEN3".into(), 30);
+        let tail = ChatMessage::new_with_markdown_timestamp("user".into(), "tail".into(), 40);
+        let turns = AIMessageManager::getMemoryFromMessages(
+            vec![stale, gen1, gen1Tail, gen2, gen2Tail, gen3, tail], &historyConfiguration(false, false)).unwrap();
+        assert_eq!(turns.iter().map(|turn| turn.content.as_str()).collect::<Vec<_>>(),
+            vec!["GEN2", "gen2 tail", "GEN3", "tail"]);
+    }
+
+    /// With a single checkpoint the projection head stays at that checkpoint (unchanged legacy behavior).
+    #[test]
+    fn deferred_compaction_single_summary_keeps_legacy_head() {
+        let stale = ChatMessage::new_with_markdown_timestamp("user".into(), "folded".into(), 5);
+        let summary = ChatMessage::new_with_markdown_timestamp("summary".into(), "GEN1".into(), 10);
+        let tail = ChatMessage::new_with_markdown_timestamp("user".into(), "tail".into(), 20);
+        let turns = AIMessageManager::getMemoryFromMessages(
+            vec![stale, summary, tail], &historyConfiguration(false, false)).unwrap();
+        assert_eq!(turns.iter().map(|turn| turn.content.as_str()).collect::<Vec<_>>(),
+            vec!["GEN1", "tail"]);
     }
 
     /// Applies group user labels after the last summary while preserving ordinary conversation histories.

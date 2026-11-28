@@ -103,6 +103,9 @@ pub struct EnhancedAIService {
     pub package_manager: PackageManagerMirror,
     pub provider_runtime_context: ProviderRuntimeContext,
     pub shared_state: Arc<Mutex<EnhancedAISharedState>>,
+    /// H2: per-chat frozen tool surface. Package activation mid-chat must not rewrite the
+    /// tools array (cache prefix). Key = chatId|language|exposure; cleared on chat deletion.
+    pub frozen_tool_surfaces: Arc<Mutex<HashMap<String, Vec<ToolPrompt>>>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -892,6 +895,7 @@ impl EnhancedAIService {
             package_manager: PackageManagerMirror,
             provider_runtime_context,
             shared_state: Arc::new(Mutex::new(EnhancedAISharedState::default())),
+            frozen_tool_surfaces: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1412,14 +1416,35 @@ impl EnhancedAIService {
         runtime: &SendMessageRuntime,
     ) -> Result<Vec<ToolPrompt>, AiServiceError> {
         if runtime.textOnly { return Ok(Vec::new()); }
+        // H2: freeze the composed tool surface for the whole chat session. The first request
+        // snapshots it; later package activations reach new tools through package_proxy without
+        // mutating the array, keeping the provider-side cache prefix stable.
+        let freezeKey = chatId.as_ref().map(|id| format!(
+            "{id}|{}|{:?}",
+            if runtime.useEnglish { "en" } else { "cn" },
+            runtime.toolExposureMode,
+        ));
+        if let Some(key) = &freezeKey {
+            if let Ok(cache) = self.frozen_tool_surfaces.lock() {
+                if let Some(frozen) = cache.get(key) {
+                    return Ok(frozen.clone());
+                }
+            }
+        }
         let tools = self.getAvailableToolsForFunction(
             functionType.clone(), chatId.clone(), Some(promptFunctionType.clone()),
             Some(runtime.chatConfiguration.profile.id.clone()), None, None, runtime,
         );
-        applyToolPromptComposeHooksToAvailableTools(
+        let composed = applyToolPromptComposeHooksToAvailableTools(
             tools, chatId, functionType, Some(promptFunctionType), runtime.useEnglish,
             &runtime.chatConfiguration, workspacePath, workspaceFolders, &runtime.toolExposureMode,
-        ).await
+        ).await?;
+        if let Some(key) = freezeKey {
+            if let Ok(mut cache) = self.frozen_tool_surfaces.lock() {
+                cache.insert(key, composed.clone());
+            }
+        }
+        Ok(composed)
     }
 
     /// Estimates the request window using the same workspace context as message sending.
@@ -3548,6 +3573,7 @@ impl Clone for EnhancedAIService {
             package_manager: self.package_manager.clone(),
             provider_runtime_context: self.provider_runtime_context.clone(),
             shared_state: self.shared_state.clone(),
+            frozen_tool_surfaces: self.frozen_tool_surfaces.clone(),
         }
     }
 }
